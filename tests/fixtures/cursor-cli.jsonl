@@ -1,0 +1,8 @@
+{"type":"system","subtype":"init","session_id":"cursor-cli","model":"example-model"}
+{"type":"user","session_id":"cursor-cli","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}
+{"type":"assistant","session_id":"cursor-cli","timestamp_ms":1790848800000,"message":{"role":"assistant","content":[{"type":"text","text":"Hel"}]}}
+{"type":"assistant","session_id":"cursor-cli","timestamp_ms":1790848800001,"message":{"role":"assistant","content":[{"type":"text","text":"lo"}]}}
+{"type":"assistant","session_id":"cursor-cli","message":{"role":"assistant","content":[{"type":"text","text":"Hello"}]}}
+{"type":"tool_call","subtype":"started","session_id":"cursor-cli","call_id":"cli-tool","tool_call":{"readToolCall":{"args":{"path":"hello.txt"}}}}
+{"type":"tool_call","subtype":"completed","session_id":"cursor-cli","call_id":"cli-tool","tool_call":{"readToolCall":{"result":{"success":{"content":"hello"}}}}}
+{"type":"result","subtype":"success","session_id":"cursor-cli","result":"Hello"}

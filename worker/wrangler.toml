@@ -1,0 +1,18 @@
+name = "harness-durable"
+main = "src/index.ts"
+compatibility_date = "2026-08-01"
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "harness-durable"
+
+[[durable_objects.bindings]]
+name = "ARCHIVES"
+class_name = "Archive"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Archive"]
+
+# Set with `npx wrangler secret put API_TOKEN`.
+# API_TOKEN is intentionally absent from this file.

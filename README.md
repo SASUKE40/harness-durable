@@ -1,0 +1,179 @@
+# Harness Durable
+
+Capture Codex, Pi, and Cursor sessions into portable, native [Lance](https://github.com/lance-format/lance) datasets. Import existing history, watch active sessions, and synchronize archives to S3 or Cloudflare R2 with Durable Objects.
+
+The collector and query engine are Rust. Cloudflare runs a small TypeScript service that stores files in R2 and publication metadata in a SQLite-backed Durable Object. No Lance runtime or conversion runs inside a Worker.
+
+## Build and try it
+
+Requires Rust 1.91 or newer, a C/C++ toolchain, and `protoc`. The initial build includes Lance/Arrow/DataFusion and takes several minutes. macOS and Linux are supported.
+
+```sh
+cargo build --release --locked
+./target/release/harness-durable --help
+
+# Try synthetic fixtures without reading any personal sessions.
+./target/release/harness-durable --state-dir /tmp/harness-demo import \
+  --harness pi --path tests/fixtures/pi.jsonl
+./target/release/harness-durable --state-dir /tmp/harness-demo sessions
+./target/release/harness-durable --state-dir /tmp/harness-demo query \
+  --kind tool_result --format jsonl
+```
+
+Install with `cargo install --path . --locked`. The CLI's global options are `--config PATH` and `--state-dir PATH`.
+
+```sh
+# Read-only discovery: prints source identities as JSONL.
+harness-durable discover
+harness-durable discover --harness codex
+
+# Without --path, capture standard roots for selected harnesses.
+harness-durable import --harness codex
+harness-durable watch --harness pi
+harness-durable watch --project /path/to/project
+
+# Explicit input requires a harness. Repeat --path for multiple sources.
+harness-durable import --harness cursor --path /path/to/transcript.jsonl
+harness-durable watch --harness cursor --path /path/to/cli-output.ndjson
+
+harness-durable status
+harness-durable sessions --format jsonl
+harness-durable query --session SESSION_ID --kind message
+harness-durable query --harness pi --text "error" \
+  --since 2026-10-01T00:00:00Z --until 2026-10-02T00:00:00Z --format jsonl
+harness-durable export --session SESSION_ID --output /tmp/session-export
+```
+
+The export directory contains `records.lance`, `events.lance`, and `manifest.json`. Both `.lance` directories are standalone datasets readable with official Lance tooling, for example `lance.dataset("/tmp/session-export/events.lance")` in Python. Export destinations must not already exist.
+
+Query filters are optional and intersect. Text matching is case-sensitive substring matching. Timestamps are optional UTC RFC3339 strings normalized to milliseconds; time filters exclude events whose source has no timestamp. Ordering is deterministic by harness, session, source, byte position, and content-block index. Separate transcript/hook streams retain their own order; there is no fabricated global chronology. `sessions` counts deduplicate record IDs and correlated tool events.
+
+## Configuration
+
+See [config.example.toml](config.example.toml). By default the configuration is `~/.harness-durable/config.toml`, and state is stored in `~/.harness-durable`. `--config` overrides the configuration location; `--state-dir` overrides storage only. Paths are literal and do not expand shell variables or `~`.
+
+Default discovery roots:
+
+- Codex: `$CODEX_HOME/sessions` and `$CODEX_HOME/archived_sessions`; `CODEX_HOME` defaults to `~/.codex`.
+- Pi: `$PI_CODING_AGENT_SESSION_DIR`, otherwise `~/.pi/agent/sessions`.
+- Cursor: JSONL transcripts beneath `~/.cursor/projects`, plus this collector's hook spool.
+
+An explicit `sources` entry replaces default discovery roots for its harness. `--path` replaces configured/default roots for the selected harness. `--project` matches the recorded working directory or the source path by substring. Inputs are read-only; capture never modifies harness sessions.
+
+The adapter API (`SessionAdapter`) provides roots, source identification, and normalization. Shared capture code handles incremental reads and durable checkpoints. Add a new adapter and register its name in `adapters::adapter` and the CLI to extend the supported harnesses.
+
+## Cursor live enrichment
+
+Desktop transcripts do not always include tool results. Optional hooks capture future tool outputs and lifecycle metadata. They cannot recover results omitted from historical files.
+
+```sh
+harness-durable hooks install cursor
+harness-durable watch --harness cursor
+# Later:
+harness-durable hooks uninstall cursor
+```
+
+Installation uses the current executable's absolute path, so install the binary in a permanent location first. Default configuration is `~/.cursor/hooks.json`; use `--hooks-file PATH` for a different scope. The installer adds `sessionStart`, `sessionEnd`, `postToolUse`, and `postToolUseFailure` entries and records ownership next to the config. Uninstallation removes only unchanged entries owned by this installation, preserving unrelated hooks and settings.
+
+The hidden `hooks receive` command accepts Cursor's JSON on stdin, writes an immutable local spool item, and emits `{}`. It makes no network request and fails open. The original stdin bytes are retained alongside compact JSONL; the archive's raw record uses the original bytes. Repeated deliveries remain in the raw archive, while matching `(harness, session, kind, tool-call ID)` events are collapsed in query results, preferring transcript events.
+
+For CLI capture, save Cursor's structured output using its documented `--print --output-format stream-json` options and import/watch that file. Streaming deltas are classified separately from complete assistant messages; terminal result summaries are lifecycle events. The collector does not launch or control the harness.
+
+## S3
+
+Create a private test or production bucket yourself, then add:
+
+```toml
+[[remotes]]
+name = "s3"
+kind = "s3"
+bucket = "my-session-archive"
+prefix = "harness"
+region = "us-west-2"
+```
+
+Credentials use the AWS SDK default provider chain, including environment variables, shared profiles, workload identity, and instance/task roles. Temporary credentials refresh through the provider. For S3-compatible endpoints, set `endpoint`; `allow_http = true` is only needed for local HTTP services. Grant list/get/put and multipart-upload permissions under the configured prefix. No bucket creation or remote deletion is performed by the collector.
+
+```sh
+harness-durable sync --remote s3
+harness-durable sessions --remote s3
+harness-durable query --remote s3 --session SESSION_ID --format jsonl
+```
+
+Files live below `<prefix>/<collector-id>/<batch-id>/`. Conditional registration reserves the batch inventory. Dataset objects upload before `manifest.json`, the publication marker. Readers ignore registrations and unfinished uploads. Multiple machines have separate collector IDs and never mutate a shared Lance dataset.
+
+## Cloudflare R2 + Durable Objects
+
+Requires Node 22+ and a Cloudflare account with R2 and SQLite-backed Durable Objects enabled. Deployment is explicit:
+
+```sh
+cd worker
+npm ci
+npx wrangler login
+npx wrangler r2 bucket create harness-durable
+npx wrangler secret put API_TOKEN
+npm run deploy
+```
+
+Use a strong private token. Adjust the bucket binding in `worker/wrangler.toml` if you choose a different bucket name. Add a collector destination:
+
+```toml
+[[remotes]]
+name = "cloudflare"
+kind = "cloudflare"
+url = "https://harness-durable.YOUR-SUBDOMAIN.workers.dev"
+archive = "personal"
+token_env = "HARNESS_DURABLE_TOKEN"
+```
+
+Set `HARNESS_DURABLE_TOKEN` to the same token, then use `sync`, `sessions`, `query`, or `export` with `--remote cloudflare`. Multiple collectors can use the same archive. This is a single-owner service: possession of the token grants access to all archive IDs in that deployment. No public file URLs are created.
+
+The API requires `Authorization: Bearer TOKEN`. All routes begin `/v1/archives/{archive}`:
+
+- `PUT /batches/{collector}/{batch}` registers the JSON manifest. Identical registration is idempotent; conflicting content returns 409.
+- `PUT /batches/{collector}/{batch}/files/{relative-path}` streams a registered file to R2 with its declared length and SHA-256 checksum.
+- `POST /batches/{collector}/{batch}/commit` publishes only when every registered file was successfully verified. Incomplete inventories return 409.
+- `GET /batches?after=CURSOR` lists committed manifests, 100 per page, with an optional `next` cursor.
+- `GET /sessions?after=CURSOR` lists committed per-batch session summaries. The CLI computes deduplicated counts from Lance data.
+- `GET /batches/{collector}/{batch}/files/{relative-path}` downloads a published file; unpublished files return 404.
+
+Metadata requests are limited to 1 MiB and 10,000 files/sessions per manifest. Dataset uploads stream through the Worker; normal Cloudflare request-size limits still apply. One Durable Object coordinates each archive. R2 writes verify content before SQLite marks files uploaded. Publication and session metadata update atomically in SQLite.
+
+## Durability and format
+
+The schemas carry `harness_durable_schema_version = 1`; files use stable Lance storage version 2.1. Dependencies and lockfiles pin the writer implementation.
+
+- `records.lance`: `id`, `harness`, `session_id`, `source_id`, `source_path`, `position` (uint64 byte offset), `captured_at`, `status`, nullable `diagnostic`, `adapter_version`, and `raw` (binary).
+- `events.lance`: `id`, `record_id`, `harness`, `session_id`, `source_id`, nullable `parent_session_id`, `native_id`, `parent_id`, `position`, `sub_index` (uint32), nullable `timestamp`, `kind`, nullable `role`, `text`, `model`, `tool_call_id`, and `payload_json`.
+
+All other columns are UTF-8. `payload_json` preserves structured normalized content; complete source information remains in `records.raw`. Event kinds include message, tool_call, tool_result, metadata, lifecycle, compaction, branch, model_change, usage, reasoning, attachment, delta, auxiliary, and unknown. Unknown or malformed complete records remain recoverable and appear in diagnostics/status. Messages duplicated in Codex event notifications are auxiliary events.
+
+SQLite uses WAL and FULL synchronization. Source checkpoints, seen IDs, and pending records commit together. Batch files and directories are synchronized before atomic publication; pending payloads are removed only after the batch is registered in SQLite. A crash after publication reuses the deterministic batch ID. The compact seen-ID catalog is retained to make repeated imports idempotent.
+
+The watcher combines filesystem notifications with 30-second rescans. Batches flush after 5 seconds, 1,000 records, or 8 MiB; one oversized record is kept intact. Network transfers run separately, retry transient upload failures with bounded backoff, and leave failed uploads pending. Ctrl-C flushes local records and cancels outstanding transfers safely; use `sync` to drain the backlog. `status`, `sessions`, `query`, and `export` can read published batches during watch. Only one writer uses each state directory.
+
+Renames, replaced files, truncation, and changed checkpoint boundaries trigger replay with deterministic deduplication. A trailing line without a newline is deferred until the writer completes it. Sources are treated as append-only between checkpoints; arbitrary edits deep inside a previously consumed file should be reimported using a fresh state directory. Raw IDs distinguish equal content at different source positions.
+
+Remote queries list committed manifests, select relevant sessions, download and checksum-verify datasets into a local cache, and scan them with Lance. Queries do not execute on the Worker. This initial version favors inspectable immutable batches over automatic compaction; use `export` for a consolidated dataset.
+
+## Tests
+
+```sh
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cd worker
+npm ci
+npm run typecheck
+npm test
+```
+
+Fixtures contain synthetic sessions only. Tests cover parser semantics, branches/compaction, unknown records, incomplete lines, replacements, mirrored data, hook ownership/correlation, native Lance round trips, crash recovery, checksums, Worker authentication, concurrent collectors, and idempotent publication.
+
+Run the S3 integration test with a local Moto server or an isolated S3-compatible test bucket. Set `HARNESS_TEST_S3_ENDPOINT`, `HARNESS_TEST_S3_BUCKET`, and AWS credentials, then run `cargo test --test cloud s3_round_trip -- --ignored`. CI runs this with Moto. No production account is needed.
+
+For Rust-to-Worker integration, run `npx wrangler dev --var API_TOKEN:test-token` in `worker`, set `HARNESS_DURABLE_TOKEN=test-token`, and run `cargo test --test cloud cloudflare_round_trip -- --ignored`. `HARNESS_TEST_CLOUDFLARE_URL` defaults to `http://127.0.0.1:8787`. Service tests write synthetic data under unique archive/prefix IDs and do not delete cloud data.
+
+## Boundaries
+
+V1 archives and queries locally available JSONL/NDJSON sessions; it does not restore harness state, translate sessions between harnesses, scrape private Cursor databases, or claim coverage of remote-only/compressed proprietary history. Missing timestamps/results remain missing. External attachment URLs are preserved, not fetched. There is no automatic redaction: raw session text and tool outputs are intentionally retained. Remote synchronization begins only after you configure a destination. Retention/deletion, team identities, a web UI, and semantic search are outside this release.

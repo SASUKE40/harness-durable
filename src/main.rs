@@ -1,0 +1,446 @@
+use anyhow::{Context, Result, ensure};
+use clap::{Args, Parser, Subcommand};
+use harness_durable::{
+    adapters::{self, Source},
+    archive,
+    config::Config,
+    hooks,
+    model::Query,
+    remote,
+    state::State,
+};
+use notify::Watcher;
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
+
+#[derive(Parser)]
+#[command(
+    version,
+    about = "Capture coding-agent sessions into portable Lance archives"
+)]
+struct Cli {
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+    #[arg(long, global = true)]
+    state_dir: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Command,
+}
+#[derive(Subcommand)]
+enum Command {
+    Discover(Capture),
+    Import(Capture),
+    Watch(Capture),
+    Sync {
+        #[arg(long)]
+        remote: Option<String>,
+    },
+    Status,
+    Sessions(ReadOptions),
+    Query(ReadOptions),
+    Export {
+        #[command(flatten)]
+        read: ReadOptions,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    Hooks {
+        #[command(subcommand)]
+        command: HookCommand,
+    },
+}
+#[derive(Args, Default)]
+struct Capture {
+    #[arg(long,value_parser=["codex","pi","cursor"])]
+    harness: Option<String>,
+    #[arg(long)]
+    path: Vec<PathBuf>,
+    /// Match the recorded working directory, or transcript path, by substring.
+    #[arg(long)]
+    project: Option<String>,
+}
+#[derive(Args, Default)]
+struct ReadOptions {
+    #[arg(long)]
+    remote: Option<String>,
+    #[arg(long)]
+    harness: Option<String>,
+    #[arg(long)]
+    session: Option<String>,
+    #[arg(long)]
+    since: Option<String>,
+    #[arg(long)]
+    until: Option<String>,
+    #[arg(long)]
+    kind: Option<String>,
+    #[arg(long)]
+    text: Option<String>,
+    #[arg(long,default_value="text",value_parser=["text","jsonl"])]
+    format: String,
+}
+#[derive(Subcommand)]
+enum HookCommand {
+    Install {
+        #[arg(value_parser=["cursor"])]
+        harness: String,
+        #[arg(long)]
+        hooks_file: Option<PathBuf>,
+    },
+    Uninstall {
+        #[arg(value_parser=["cursor"])]
+        harness: String,
+        #[arg(long)]
+        hooks_file: Option<PathBuf>,
+    },
+    #[command(hide = true)]
+    Receive,
+}
+
+fn roots(config: &Config, capture: &Capture) -> Result<Vec<(String, Vec<PathBuf>)>> {
+    ensure!(
+        capture.path.is_empty() || capture.harness.is_some(),
+        "--path requires --harness"
+    );
+    let home = directories::BaseDirs::new().context("home directory")?;
+    let mut out = Vec::new();
+    for name in ["codex", "pi", "cursor"] {
+        if capture.harness.as_ref().is_some_and(|h| h != name) {
+            continue;
+        }
+        let a = adapters::adapter(name)?;
+        let mut paths = if !capture.path.is_empty() {
+            capture.path.clone()
+        } else {
+            let configured: Vec<_> = config
+                .sources
+                .iter()
+                .filter(|s| s.harness == name)
+                .map(|s| s.path.clone())
+                .collect();
+            if configured.is_empty() {
+                a.roots(home.home_dir())
+            } else {
+                configured
+            }
+        };
+        if name == "cursor" {
+            paths.push(config.state_dir.join("hooks"));
+        }
+        out.push((name.into(), paths));
+    }
+    Ok(out)
+}
+fn discover(config: &Config, capture: &Capture) -> Result<Vec<Source>> {
+    let mut sources = Vec::new();
+    for (name, paths) in roots(config, capture)? {
+        sources.extend(adapters::discover(
+            adapters::adapter(&name)?.as_ref(),
+            &paths,
+        )?);
+    }
+    sources.retain(|s| {
+        capture.project.as_ref().is_none_or(|p| {
+            s.project.as_ref().is_some_and(|v| v.contains(p))
+                || s.path.to_string_lossy().contains(p)
+        })
+    });
+    Ok(sources)
+}
+
+async fn flush_all(state: &mut State, c: &Config) -> Result<()> {
+    while archive::flush(state, c.max_records, c.max_bytes)
+        .await?
+        .is_some()
+    {}
+    Ok(())
+}
+async fn capture_once(state: &mut State, c: &Config, args: &Capture) -> Result<usize> {
+    let mut count = 0;
+    for source in discover(c, args)? {
+        loop {
+            let n = match state.ingest(&source, c.max_records, c.max_bytes) {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("capture {}: {e:#}", source.path.display());
+                    break;
+                }
+            };
+            count += n;
+            let (records, bytes) = state.pending_size()?;
+            if records >= c.max_records || bytes >= c.max_bytes {
+                flush_all(state, c).await?;
+            }
+            if n == 0 {
+                break;
+            }
+        }
+    }
+    Ok(count)
+}
+async fn watch(state: &mut State, c: &Config, args: &Capture) -> Result<()> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        if event.is_ok() {
+            let _ = tx.try_send(());
+        }
+    })?;
+    for (_, paths) in roots(c, args)? {
+        for path in paths {
+            if path.exists()
+                && let Err(e) = watcher.watch(&path, notify::RecursiveMode::Recursive)
+            {
+                eprintln!(
+                    "watch {}: {e}; periodic scanning remains active",
+                    path.display()
+                );
+            }
+        }
+    }
+    let mut tick =
+        tokio::time::interval(Duration::from_secs(c.flush_seconds.min(c.rescan_seconds)));
+    let mut last_scan = Instant::now() - Duration::from_secs(c.rescan_seconds);
+    let mut last_flush = Instant::now();
+    let (sync_tx, mut sync_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut uploading: Option<tokio::task::JoinHandle<()>> = None;
+    loop {
+        let changed = tokio::select! {
+            _=tokio::signal::ctrl_c()=>break,
+            _=tick.tick()=>false,
+            event=rx.recv()=>event.is_some(),
+            Some(update)=sync_rx.recv()=> {
+                match update {
+                    remote::SyncUpdate::Uploaded { remote,batch } => state.mark_uploaded(&remote,&batch)?,
+                    remote::SyncUpdate::Failed(e) => eprintln!("sync pending; will retry: {e}"),
+                    remote::SyncUpdate::Finished => uploading=None,
+                }
+                false
+            }
+        };
+        if changed || last_scan.elapsed() >= Duration::from_secs(c.rescan_seconds) {
+            capture_once(state, c, args).await?;
+            last_scan = Instant::now();
+        }
+        if last_flush.elapsed() >= Duration::from_secs(c.flush_seconds) {
+            flush_all(state, c).await?;
+            if uploading.is_none() && !c.remotes.is_empty() {
+                uploading = Some(remote::background_sync(state, &c.remotes, sync_tx.clone())?);
+            }
+            last_flush = Instant::now();
+        }
+    }
+    flush_all(state, c).await?;
+    if let Some(job) = uploading {
+        job.abort();
+    }
+    eprintln!("Capture stopped; unpublished batches remain available for sync");
+    Ok(())
+}
+fn query_options(r: &ReadOptions) -> Result<Query> {
+    let normalize = |s: &Option<String>| -> Result<Option<String>> {
+        s.as_ref()
+            .map(|s| {
+                Ok(chrono::DateTime::parse_from_rfc3339(s)?
+                    .with_timezone(&chrono::Utc)
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+            })
+            .transpose()
+    };
+    let q = Query {
+        harness: r.harness.clone(),
+        session: r.session.clone(),
+        since: normalize(&r.since)?,
+        until: normalize(&r.until)?,
+        kind: r.kind.clone(),
+        text: r.text.clone(),
+    };
+    ensure!(
+        q.since
+            .as_ref()
+            .zip(q.until.as_ref())
+            .is_none_or(|(a, b)| a <= b),
+        "--since must precede --until"
+    );
+    Ok(q)
+}
+async fn paths(state: &State, c: &Config, r: &ReadOptions, q: &Query) -> Result<Vec<PathBuf>> {
+    if let Some(name) = &r.remote {
+        let remote = c
+            .remotes
+            .iter()
+            .find(|x| x.name() == name)
+            .with_context(|| format!("unknown remote {name}"))?;
+        remote::cached_paths(remote, &state.root, q).await
+    } else {
+        state.batch_paths()
+    }
+}
+fn default_hooks() -> Result<PathBuf> {
+    Ok(directories::BaseDirs::new()
+        .context("home directory")?
+        .home_dir()
+        .join(".cursor/hooks.json"))
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let mut c = Config::load(cli.config.as_deref(), cli.state_dir)?;
+    if c.state_dir.is_relative() {
+        c.state_dir = std::env::current_dir()?.join(&c.state_dir);
+    }
+    if let Command::Hooks { command } = &cli.command {
+        match command {
+            HookCommand::Receive => {
+                if let Err(e) = hooks::receive(&c.state_dir, std::io::stdin().lock()) {
+                    eprintln!("capture hook: {e:#}");
+                }
+                println!("{{}}");
+            }
+            HookCommand::Install { hooks_file, .. } => {
+                hooks::install(
+                    &hooks_file.clone().unwrap_or(default_hooks()?),
+                    &c.state_dir,
+                    &std::env::current_exe()?,
+                )?;
+                println!("Cursor capture hooks installed");
+            }
+            HookCommand::Uninstall { hooks_file, .. } => {
+                hooks::uninstall(&hooks_file.clone().unwrap_or(default_hooks()?))?;
+                println!("Cursor capture hooks removed");
+            }
+        }
+        return Ok(());
+    }
+    if let Command::Discover(args) = &cli.command {
+        for s in discover(&c, args)? {
+            println!("{}", serde_json::to_string(&s)?);
+        }
+        return Ok(());
+    }
+    let readonly = matches!(
+        cli.command,
+        Command::Status | Command::Query(_) | Command::Sessions(_) | Command::Export { .. }
+    );
+    let mut state = if readonly && c.state_dir.join("state.sqlite").exists() {
+        State::open_reader(&c.state_dir)?
+    } else {
+        State::open(&c.state_dir)?
+    };
+    match cli.command {
+        Command::Import(args) => {
+            let count = capture_once(&mut state, &c, &args).await?;
+            flush_all(&mut state, &c).await?;
+            eprintln!("Processed {count} complete source records");
+            remote::sync(&state, &c.remotes, None).await?;
+        }
+        Command::Watch(args) => watch(&mut state, &c, &args).await?,
+        Command::Sync { remote } => {
+            flush_all(&mut state, &c).await?;
+            remote::sync(&state, &c.remotes, remote.as_deref()).await?;
+        }
+        Command::Status => println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &state.status(
+                    &c.remotes
+                        .iter()
+                        .map(|r| r.name().to_string())
+                        .collect::<Vec<_>>()
+                )?
+            )?
+        ),
+        Command::Query(r) => {
+            let q = query_options(&r)?;
+            for e in archive::query(&paths(&state, &c, &r, &q).await?, &q).await? {
+                if r.format == "jsonl" {
+                    println!("{}", serde_json::to_string(&e)?);
+                } else {
+                    println!(
+                        "{} {} {} {} {}",
+                        e.harness,
+                        e.session_id,
+                        e.timestamp.as_deref().unwrap_or("—"),
+                        e.kind,
+                        e.text.as_deref().unwrap_or("")
+                    );
+                }
+            }
+        }
+        Command::Sessions(r) => {
+            let q = query_options(&r)?;
+            let p = paths(&state, &c, &r, &q).await?;
+            let mut records = Vec::new();
+            let mut seen = HashSet::new();
+            for path in &p {
+                for rec in archive::read_records(path).await? {
+                    if seen.insert(rec.id.clone())
+                        && q.harness.as_ref().is_none_or(|h| h == &rec.harness)
+                        && q.session.as_ref().is_none_or(|s| s == &rec.session_id)
+                    {
+                        records.push(rec);
+                    }
+                }
+            }
+            let events = archive::query(&p, &q).await?;
+            let filtered =
+                r.since.is_some() || r.until.is_some() || r.kind.is_some() || r.text.is_some();
+            let matching: HashSet<_> = events.iter().map(|e| (&e.harness, &e.session_id)).collect();
+            for s in archive::summaries(&records, &events) {
+                if filtered && !matching.contains(&(&s.harness, &s.session_id)) {
+                    continue;
+                }
+                if r.format == "jsonl" {
+                    println!("{}", serde_json::to_string(&s)?);
+                } else {
+                    println!(
+                        "{} {}: {} records, {} events",
+                        s.harness, s.session_id, s.records, s.events
+                    );
+                }
+            }
+        }
+        Command::Export { read, output } => {
+            let q = query_options(&read)?;
+            let p = paths(&state, &c, &read, &q).await?;
+            let events = archive::query(&p, &q).await?;
+            let ids: HashSet<_> = events.iter().map(|e| &e.record_id).collect();
+            let mut records = Vec::new();
+            let mut seen = HashSet::new();
+            let event_filter =
+                q.kind.is_some() || q.text.is_some() || q.since.is_some() || q.until.is_some();
+            for path in p {
+                for r in archive::read_records(&path).await? {
+                    if seen.insert(r.id.clone())
+                        && q.harness.as_ref().is_none_or(|h| h == &r.harness)
+                        && q.session.as_ref().is_none_or(|s| s == &r.session_id)
+                        && (!event_filter || ids.contains(&r.id))
+                    {
+                        records.push(r);
+                    }
+                }
+            }
+            let output = absolute(&output)?;
+            archive::write_archive(
+                &output,
+                &state.collector_id,
+                &uuid::Uuid::new_v4().to_string(),
+                &records,
+                &events,
+            )
+            .await?;
+            println!("{}", output.display());
+        }
+        Command::Discover(_) | Command::Hooks { .. } => unreachable!(),
+    }
+    Ok(())
+}
+fn absolute(path: &Path) -> Result<PathBuf> {
+    Ok(if path.is_absolute() {
+        path.into()
+    } else {
+        std::env::current_dir()?.join(path)
+    })
+}

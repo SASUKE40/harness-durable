@@ -1,0 +1,9 @@
+/target/
+/worker/node_modules/
+/worker/.wrangler/
+/worker/coverage/
+.DS_Store
+.env
+.dev.vars
+*.sqlite*
+/archive/

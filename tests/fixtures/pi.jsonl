@@ -1,0 +1,7 @@
+{"type":"session","version":3,"id":"pi-session","timestamp":"2026-10-01T10:00:00Z","cwd":"/synthetic/project","parentSession":"/parent.jsonl"}
+{"type":"model_change","id":"a","parentId":null,"timestamp":"2026-10-01T10:00:01Z","modelId":"example-model"}
+{"type":"message","id":"b","parentId":"a","timestamp":"2026-10-01T10:00:02Z","message":{"role":"user","content":"hello"}}
+{"type":"message","id":"c","parentId":"b","timestamp":"2026-10-01T10:00:03Z","message":{"role":"assistant","model":"example-model","content":[{"type":"text","text":"Reading"},{"type":"toolCall","id":"tool-1","name":"read","arguments":{"path":"hello.txt"}}]}}
+{"type":"message","id":"d","parentId":"c","timestamp":"2026-10-01T10:00:04Z","message":{"role":"toolResult","toolCallId":"tool-1","content":[{"type":"text","text":"hello world"}],"isError":false}}
+{"type":"compaction","id":"e","parentId":"d","timestamp":"2026-10-01T10:00:05Z","summary":"Read a file","firstKeptEntryId":"b"}
+{"type":"branch_summary","id":"f","parentId":"b","timestamp":"2026-10-01T10:00:06Z","fromId":"e","summary":"Another branch"}

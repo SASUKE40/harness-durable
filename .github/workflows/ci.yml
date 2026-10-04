@@ -1,0 +1,58 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler clang
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install 'moto[server]>=5,<6'
+      - run: |
+          moto_server -H 127.0.0.1 -p 5000 > /tmp/moto.log 2>&1 &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:5000/ && break; sleep 1; done
+          python3 -c "import boto3; boto3.client('s3', endpoint_url='http://127.0.0.1:5000').create_bucket(Bucket='harness-test')"
+          cargo test --locked --test cloud s3_round_trip -- --ignored
+        env:
+          AWS_ACCESS_KEY_ID: testing
+          AWS_SECRET_ACCESS_KEY: testing
+          AWS_REGION: us-east-1
+          AWS_EC2_METADATA_DISABLED: 'true'
+          HARNESS_TEST_S3_ENDPOINT: http://127.0.0.1:5000
+          HARNESS_TEST_S3_BUCKET: harness-test
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci
+        working-directory: worker
+      - run: |
+          npx wrangler dev --port 8787 --var API_TOKEN:test-token > /tmp/wrangler.log 2>&1 &
+          for i in $(seq 1 30); do curl -sf -H 'Authorization: Bearer test-token' http://127.0.0.1:8787/v1/archives/ci/batches && break; sleep 1; done
+          cargo test --manifest-path ../Cargo.toml --locked --test cloud cloudflare_round_trip -- --ignored
+        working-directory: worker
+        env:
+          HARNESS_DURABLE_TOKEN: test-token
+  worker:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: worker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test

@@ -1,0 +1,32 @@
+# Paths are literal: use absolute paths (TOML does not expand ~ or $HOME).
+state_dir = "/absolute/path/to/.harness-durable"
+flush_seconds = 5
+max_records = 1000
+max_bytes = 8388608
+rescan_seconds = 30
+
+# Omit sources to discover the standard Codex, Pi, and Cursor directories.
+# Entries override default roots for that harness.
+# [[sources]]
+# harness = "pi"
+# path = "/absolute/path/to/sessions"
+
+# Leave remotes absent for local-only capture. Configured remotes are synced
+# automatically by import/watch, or explicitly with `sync`.
+# [[remotes]]
+# name = "s3"
+# kind = "s3"
+# bucket = "my-private-session-archive"
+# prefix = "harness"
+# region = "us-west-2"
+
+# S3-compatible local testing or direct R2 access:
+# endpoint = "http://127.0.0.1:5000"
+# allow_http = true
+
+# [[remotes]]
+# name = "cloudflare"
+# kind = "cloudflare"
+# url = "https://harness-durable.YOUR-SUBDOMAIN.workers.dev"
+# archive = "personal"
+# token_env = "HARNESS_DURABLE_TOKEN"

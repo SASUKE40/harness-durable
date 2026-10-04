@@ -1,0 +1,26 @@
+{
+  "name": "harness-durable-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "@cloudflare/workers-types": "^5.20261004.1",
+    "typescript": "^5.9.3",
+    "vitest": "4.1",
+    "wrangler": "^4.147.0"
+  },
+  "overrides": {
+    "@cloudflare/vitest-pool-workers": {
+      "wrangler": "$wrangler"
+    },
+    "undici": "^7.30.0",
+    "sharp": "^0.35.4"
+  }
+}
