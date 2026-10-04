@@ -86,10 +86,35 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Merge small local batches into larger batches (`watch` does this automatically).
+    Compact,
     Hooks {
         #[command(subcommand)]
         command: HookCommand,
     },
+}
+impl Command {
+    /// Commands that change collector state take the writer lock.
+    fn writes_state(&self) -> bool {
+        match self {
+            Self::Import(_) | Self::Watch(_) | Self::Sync { .. } | Self::Compact => true,
+            Self::Discover(_)
+            | Self::Status
+            | Self::Sessions(_)
+            | Self::Query(_)
+            | Self::Compare(_)
+            | Self::Snapshot(_)
+            | Self::Check(_)
+            | Self::Browse { .. }
+            | Self::Mcp { .. }
+            | Self::Calibrate { .. }
+            | Self::Label(_)
+            | Self::Labels { .. }
+            | Self::Evaluate(_)
+            | Self::Export { .. }
+            | Self::Hooks { .. } => false,
+        }
+    }
 }
 #[derive(Args)]
 struct Compare {
@@ -338,13 +363,15 @@ fn roots(config: &Config, capture: &Capture) -> Result<Vec<(String, Vec<PathBuf>
     }
     Ok(out)
 }
-fn discover(config: &Config, capture: &Capture) -> Result<Vec<Source>> {
+/// With a state, unchanged files reuse their cached source identity.
+fn discover(config: &Config, capture: &Capture, state: Option<&State>) -> Result<Vec<Source>> {
     let mut sources = Vec::new();
     for (name, paths) in roots(config, capture)? {
-        sources.extend(adapters::discover(
-            adapters::adapter(&name)?.as_ref(),
-            &paths,
-        )?);
+        let a = adapters::adapter(&name)?;
+        sources.extend(match state {
+            Some(state) => adapters::discover_with(&paths, |p| state.identify(a.as_ref(), p)),
+            None => adapters::discover(a.as_ref(), &paths)?,
+        });
     }
     sources.retain(|s| {
         capture.project.as_ref().is_none_or(|p| {
@@ -360,13 +387,23 @@ async fn flush_all(state: &mut State, c: &Config) -> Result<()> {
         .await?
         .is_some()
     {}
+    state.purge_hook_spool(&c.state_dir.join("hooks"))?;
     Ok(())
+}
+async fn compact(state: &mut State, c: &Config) -> Result<usize> {
+    let merged = archive::compact(state, c.compact_max_bytes).await?;
+    state.purge_replaced(harness_durable::state::REPLACED_RETENTION)?;
+    Ok(merged)
 }
 async fn capture_once(state: &mut State, c: &Config, args: &Capture) -> Result<usize> {
     let mut count = 0;
-    for source in discover(c, args)? {
+    // File reads and SQLite writes block; keep them off the async scheduler.
+    let sources = tokio::task::block_in_place(|| discover(c, args, Some(state)))?;
+    for source in sources {
         loop {
-            let n = match state.ingest(&source, c.max_records, c.max_bytes) {
+            let ingested =
+                tokio::task::block_in_place(|| state.ingest(&source, c.max_records, c.max_bytes));
+            let n = match ingested {
                 Ok(n) => n,
                 Err(e) => {
                     eprintln!("capture {}: {e:#}", source.path.display());
@@ -408,6 +445,7 @@ async fn watch(state: &mut State, c: &Config, args: &Capture) -> Result<()> {
         tokio::time::interval(Duration::from_secs(c.flush_seconds.min(c.rescan_seconds)));
     let mut last_scan = Instant::now() - Duration::from_secs(c.rescan_seconds);
     let mut last_flush = Instant::now();
+    let mut last_compact = Instant::now();
     let (sync_tx, mut sync_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut uploading: Option<tokio::task::JoinHandle<()>> = None;
     loop {
@@ -430,6 +468,15 @@ async fn watch(state: &mut State, c: &Config, args: &Capture) -> Result<()> {
         }
         if last_flush.elapsed() >= Duration::from_secs(c.flush_seconds) {
             flush_all(state, c).await?;
+            // An upload holds batch paths, so merge only between uploads.
+            if uploading.is_none()
+                && last_compact.elapsed() >= Duration::from_secs(c.compact_seconds)
+            {
+                if let Err(e) = compact(state, c).await {
+                    eprintln!("compaction skipped; will retry: {e:#}");
+                }
+                last_compact = Instant::now();
+            }
             if uploading.is_none() && !c.remotes.is_empty() {
                 uploading = Some(remote::background_sync(state, &c.remotes, sync_tx.clone())?);
             }
@@ -460,6 +507,7 @@ fn query_options(r: &ReadOptions) -> Result<Query> {
         until: normalize(&r.until)?,
         kind: r.kind.clone(),
         text: r.text.clone(),
+        event_id: None,
     };
     ensure!(
         q.since
@@ -522,7 +570,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     if let Command::Discover(args) = &cli.command {
-        for s in discover(&c, args)? {
+        for s in discover(&c, args, None)? {
             println!("{}", serde_json::to_string(&s)?);
         }
         return Ok(());
@@ -571,20 +619,7 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
-    let readonly = matches!(
-        cli.command,
-        Command::Status
-            | Command::Query(_)
-            | Command::Sessions(_)
-            | Command::Export { .. }
-            | Command::Compare(_)
-            | Command::Snapshot(_)
-            | Command::Check(_)
-            | Command::Browse { .. }
-            | Command::Label(_)
-            | Command::Evaluate(_)
-    );
-    let mut state = if readonly && c.state_dir.join("state.sqlite").exists() {
+    let mut state = if !cli.command.writes_state() && c.state_dir.join("state.sqlite").exists() {
         State::open_reader(&c.state_dir)?
     } else {
         State::open(&c.state_dir)?
@@ -879,7 +914,7 @@ async fn main() -> Result<()> {
         ),
         Command::Query(r) => {
             let q = query_options(&r)?;
-            for e in archive::query(&paths(&state, &c, &r, &q).await?, &q).await? {
+            archive::query_each(&paths(&state, &c, &r, &q).await?, &q, |e| {
                 if r.format == "jsonl" {
                     println!("{}", serde_json::to_string(&e)?);
                 } else {
@@ -892,31 +927,13 @@ async fn main() -> Result<()> {
                         e.text.as_deref().unwrap_or("")
                     );
                 }
-            }
+                Ok(())
+            })
+            .await?;
         }
         Command::Sessions(r) => {
             let q = query_options(&r)?;
-            let p = paths(&state, &c, &r, &q).await?;
-            let mut records = Vec::new();
-            let mut seen = HashSet::new();
-            for path in &p {
-                for rec in archive::read_records(path).await? {
-                    if seen.insert(rec.id.clone())
-                        && q.harness.as_ref().is_none_or(|h| h == &rec.harness)
-                        && q.session.as_ref().is_none_or(|s| s == &rec.session_id)
-                    {
-                        records.push(rec);
-                    }
-                }
-            }
-            let events = archive::query(&p, &q).await?;
-            let filtered =
-                r.since.is_some() || r.until.is_some() || r.kind.is_some() || r.text.is_some();
-            let matching: HashSet<_> = events.iter().map(|e| (&e.harness, &e.session_id)).collect();
-            for s in archive::summaries(&records, &events) {
-                if filtered && !matching.contains(&(&s.harness, &s.session_id)) {
-                    continue;
-                }
+            for s in archive::session_summaries(&paths(&state, &c, &r, &q).await?, &q).await? {
                 if r.format == "jsonl" {
                     println!("{}", serde_json::to_string(&s)?);
                 } else {
@@ -929,34 +946,20 @@ async fn main() -> Result<()> {
         }
         Command::Export { read, output } => {
             let q = query_options(&read)?;
-            let p = paths(&state, &c, &read, &q).await?;
-            let events = archive::query(&p, &q).await?;
-            let ids: HashSet<_> = events.iter().map(|e| &e.record_id).collect();
-            let mut records = Vec::new();
-            let mut seen = HashSet::new();
-            let event_filter =
-                q.kind.is_some() || q.text.is_some() || q.since.is_some() || q.until.is_some();
-            for path in p {
-                for r in archive::read_records(&path).await? {
-                    if seen.insert(r.id.clone())
-                        && q.harness.as_ref().is_none_or(|h| h == &r.harness)
-                        && q.session.as_ref().is_none_or(|s| s == &r.session_id)
-                        && (!event_filter || ids.contains(&r.id))
-                    {
-                        records.push(r);
-                    }
-                }
-            }
             let output = absolute(&output)?;
-            archive::write_archive(
+            archive::export(
+                &paths(&state, &c, &read, &q).await?,
+                &q,
                 &output,
                 &state.collector_id,
-                &uuid::Uuid::new_v4().to_string(),
-                &records,
-                &events,
             )
             .await?;
             println!("{}", output.display());
+        }
+        Command::Compact => {
+            flush_all(&mut state, &c).await?;
+            let merged = compact(&mut state, &c).await?;
+            println!("Merged {merged} batches");
         }
         Command::Discover(_)
         | Command::Hooks { .. }

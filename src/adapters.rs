@@ -93,12 +93,10 @@ pub fn identify(a: &dyn SessionAdapter, path: &Path) -> Result<Source> {
     )
 }
 
-pub fn discover(a: &dyn SessionAdapter, roots: &[PathBuf]) -> Result<Vec<Source>> {
+/// JSONL and NDJSON files below the roots, sorted and without duplicates.
+pub fn candidates(roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut result = Vec::new();
-    for root in roots {
-        if !root.exists() {
-            continue;
-        }
+    for root in roots.iter().filter(|r| r.exists()) {
         for entry in walkdir::WalkDir::new(root).follow_links(false) {
             let entry = match entry {
                 Ok(e) => e,
@@ -107,23 +105,36 @@ pub fn discover(a: &dyn SessionAdapter, roots: &[PathBuf]) -> Result<Vec<Source>
                     continue;
                 }
             };
-            if !entry.file_type().is_file()
-                || entry
+            if entry.file_type().is_file()
+                && entry
                     .path()
                     .extension()
-                    .is_none_or(|e| e != "jsonl" && e != "ndjson")
+                    .is_some_and(|e| e == "jsonl" || e == "ndjson")
             {
-                continue;
-            }
-            match identify(a, entry.path()) {
-                Ok(s) => result.push(s),
-                Err(e) => eprintln!("discovery: {e}"),
+                result.push(entry.into_path());
             }
         }
     }
-    result.sort_by(|a, b| a.path.cmp(&b.path));
-    result.dedup_by(|a, b| a.path == b.path);
-    Ok(result)
+    result.sort();
+    result.dedup();
+    result
+}
+
+pub fn discover(a: &dyn SessionAdapter, roots: &[PathBuf]) -> Result<Vec<Source>> {
+    Ok(discover_with(roots, |path| identify(a, path)))
+}
+pub fn discover_with(
+    roots: &[PathBuf],
+    mut identify: impl FnMut(&Path) -> Result<Source>,
+) -> Vec<Source> {
+    let mut result = Vec::new();
+    for path in candidates(roots) {
+        match identify(&path) {
+            Ok(s) => result.push(s),
+            Err(e) => eprintln!("discovery: {e}"),
+        }
+    }
+    result
 }
 
 fn blocks(v: &Value, role: Option<String>) -> Vec<Event> {

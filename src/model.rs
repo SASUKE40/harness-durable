@@ -73,6 +73,9 @@ pub struct Manifest {
     pub created_at: String,
     pub sessions: Vec<SessionSummary>,
     pub files: Vec<InventoryFile>,
+    /// Batch IDs from the same collector whose content this batch contains.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replaces: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -83,6 +86,8 @@ pub struct Query {
     pub until: Option<String>,
     pub kind: Option<String>,
     pub text: Option<String>,
+    #[serde(default)]
+    pub event_id: Option<String>,
 }
 
 impl Query {
@@ -91,7 +96,8 @@ impl Query {
             && self.session.as_ref().is_none_or(|id| id == &s.session_id)
     }
     pub fn matches(&self, e: &Event) -> bool {
-        self.harness.as_ref().is_none_or(|h| h == &e.harness)
+        self.event_id.as_ref().is_none_or(|id| id == &e.id)
+            && self.harness.as_ref().is_none_or(|h| h == &e.harness)
             && self.session.as_ref().is_none_or(|s| s == &e.session_id)
             && self.kind.as_ref().is_none_or(|k| k == &e.kind)
             && self

@@ -5,11 +5,16 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    /// Empty means `~/.harness-durable`, resolved by `Config::load`.
     pub state_dir: PathBuf,
     pub flush_seconds: u64,
     pub max_records: usize,
     pub max_bytes: usize,
     pub rescan_seconds: u64,
+    /// `watch` merges small local batches this often.
+    pub compact_seconds: u64,
+    /// Upper size of a merged batch, in bytes of Lance files.
+    pub compact_max_bytes: u64,
     pub sources: Vec<SourceConfig>,
     pub remotes: Vec<RemoteConfig>,
     pub feedback: crate::feedback::FeedbackConfig,
@@ -17,18 +22,26 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        let home = directories::BaseDirs::new().expect("home directory");
         Self {
-            state_dir: home.home_dir().join(".harness-durable"),
+            state_dir: PathBuf::new(),
             flush_seconds: 5,
             max_records: 1000,
             max_bytes: 8 * 1024 * 1024,
             rescan_seconds: 30,
+            compact_seconds: 600,
+            compact_max_bytes: 128 * 1024 * 1024,
             sources: vec![],
             remotes: vec![],
             feedback: crate::feedback::FeedbackConfig::default(),
         }
     }
+}
+
+fn default_state_dir() -> Result<PathBuf> {
+    Ok(directories::BaseDirs::new()
+        .context("cannot find the home directory; use --state-dir and --config")?
+        .home_dir()
+        .join(".harness-durable"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,24 +82,32 @@ impl RemoteConfig {
 
 impl Config {
     pub fn load(path: Option<&Path>, state_dir: Option<PathBuf>) -> Result<Self> {
-        let default_path = Self::default().state_dir.join("config.toml");
-        let p = path.unwrap_or(&default_path);
-        let mut config: Self = if p.exists() {
-            toml::from_str(&std::fs::read_to_string(p)?)
-                .with_context(|| format!("invalid config {}", p.display()))?
-        } else {
-            ensure!(path.is_none(), "config does not exist: {}", p.display());
-            Self::default()
+        let mut config: Self = match path {
+            Some(p) => {
+                ensure!(p.exists(), "config does not exist: {}", p.display());
+                toml::from_str(&std::fs::read_to_string(p)?)
+                    .with_context(|| format!("invalid config {}", p.display()))?
+            }
+            None => match default_state_dir().map(|d| d.join("config.toml")) {
+                Ok(p) if p.exists() => toml::from_str(&std::fs::read_to_string(&p)?)
+                    .with_context(|| format!("invalid config {}", p.display()))?,
+                _ => Self::default(),
+            },
         };
         if let Some(s) = state_dir {
             config.state_dir = s;
+        }
+        if config.state_dir.as_os_str().is_empty() {
+            config.state_dir = default_state_dir()?;
         }
         ensure!(
             config.flush_seconds > 0
                 && config.max_records > 0
                 && config.max_bytes > 0
-                && config.rescan_seconds > 0,
-            "batch and scan thresholds must be positive"
+                && config.rescan_seconds > 0
+                && config.compact_seconds > 0
+                && config.compact_max_bytes > 0,
+            "batch, scan, and compaction thresholds must be positive"
         );
         let mut names = std::collections::HashSet::new();
         config.feedback.validate()?;

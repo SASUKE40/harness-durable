@@ -29,22 +29,32 @@ pub struct Pair {
     pub archive: Option<PathBuf>,
     pub remote: Option<String>,
 }
-pub fn sessions(events: &[Event], filter: &str) -> Vec<SessionRow> {
-    let filter = filter.to_lowercase();
-    let mut rows: BTreeMap<(String, String), SessionRow> = BTreeMap::new();
-    let mut matching = std::collections::HashSet::new();
-    for e in events {
+/// Case-insensitive session search over text, harness, and session ID.
+struct SessionIndex {
+    filter: String,
+    rows: BTreeMap<(String, String), SessionRow>,
+    matching: std::collections::HashSet<(String, String)>,
+}
+impl SessionIndex {
+    fn new(filter: &str) -> Self {
+        Self {
+            filter: filter.to_lowercase(),
+            rows: BTreeMap::new(),
+            matching: Default::default(),
+        }
+    }
+    fn add(&mut self, e: &Event) {
         let key = (e.harness.clone(), e.session_id.clone());
-        if filter.is_empty()
+        if self.filter.is_empty()
             || e.text
                 .as_ref()
-                .is_some_and(|t| t.to_lowercase().contains(&filter))
-            || e.harness.to_lowercase().contains(&filter)
-            || e.session_id.to_lowercase().contains(&filter)
+                .is_some_and(|t| t.to_lowercase().contains(&self.filter))
+            || e.harness.to_lowercase().contains(&self.filter)
+            || e.session_id.to_lowercase().contains(&self.filter)
         {
-            matching.insert(key.clone());
+            self.matching.insert(key.clone());
         }
-        let row = rows.entry(key).or_insert_with(|| SessionRow {
+        let row = self.rows.entry(key).or_insert_with(|| SessionRow {
             harness: e.harness.clone(),
             session_id: e.session_id.clone(),
             events: 0,
@@ -55,9 +65,20 @@ pub fn sessions(events: &[Event], filter: &str) -> Vec<SessionRow> {
             row.preview = e.text.as_deref().unwrap_or("").chars().take(100).collect();
         }
     }
-    rows.into_iter()
-        .filter_map(|(key, row)| matching.contains(&key).then_some(row))
-        .collect()
+    fn rows(self) -> Vec<SessionRow> {
+        let matching = self.matching;
+        self.rows
+            .into_iter()
+            .filter_map(|(key, row)| matching.contains(&key).then_some(row))
+            .collect()
+    }
+}
+pub fn sessions(events: &[Event], filter: &str) -> Vec<SessionRow> {
+    let mut index = SessionIndex::new(filter);
+    for e in events {
+        index.add(e);
+    }
+    index.rows()
 }
 pub fn safe_terminal(text: &str) -> String {
     text.chars()
@@ -192,30 +213,48 @@ pub async fn tool_call(paths: &[PathBuf], name: &str, args: Value) -> Result<Val
     if name == "get_event" {
         ensure!(a.event_id.is_some(), "get_event requires event_id");
     }
-    let events = archive::query(paths, &q).await?;
     let values: Vec<Value> = match name {
-        "search_sessions" => sessions(&events, &a.text)
-            .into_iter()
-            .map(serde_json::to_value)
-            .collect::<std::result::Result<_, _>>()?,
-        "read_session" => {
-            let identities: std::collections::HashSet<_> =
-                events.iter().map(|e| (&e.harness, &e.session_id)).collect();
-            ensure!(
-                identities.len() <= 1,
-                "session ID is ambiguous; specify harness"
-            );
-            events
+        "search_sessions" => {
+            let mut index = SessionIndex::new(&a.text);
+            archive::query_each(paths, &q, |e| {
+                index.add(&e);
+                Ok(())
+            })
+            .await?;
+            index
+                .rows()
                 .into_iter()
-                .filter(|e| {
-                    a.text.is_empty() || e.text.as_ref().is_some_and(|s| s.contains(&a.text))
-                })
                 .map(serde_json::to_value)
                 .collect::<std::result::Result<_, _>>()?
         }
-        _ => events
+        "read_session" => {
+            let mut harnesses = std::collections::HashSet::new();
+            for path in paths {
+                for s in archive::manifest(path)?.sessions {
+                    if q.matches_session(&s) {
+                        harnesses.insert(s.harness);
+                    }
+                }
+            }
+            ensure!(
+                harnesses.len() <= 1,
+                "session ID is ambiguous; specify harness"
+            );
+            let q = Query {
+                text: (!a.text.is_empty()).then(|| a.text.clone()),
+                ..q
+            };
+            let mut values = Vec::new();
+            archive::query_each(paths, &q, |e| {
+                values.push(serde_json::to_value(e)?);
+                Ok(())
+            })
+            .await?;
+            values
+        }
+        _ => archive::find_event(paths, &q, a.event_id.as_deref().unwrap_or_default())
+            .await?
             .into_iter()
-            .filter(|e| Some(&e.id) == a.event_id.as_ref())
             .map(serde_json::to_value)
             .collect::<std::result::Result<_, _>>()?,
     };
