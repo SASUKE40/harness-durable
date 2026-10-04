@@ -48,6 +48,58 @@ The export directory contains `records.lance`, `events.lance`, and `manifest.jso
 
 Query filters are optional and intersect. Text matching is case-sensitive substring matching. Timestamps are optional UTC RFC3339 strings normalized to milliseconds; time filters exclude events whose source has no timestamp. Ordering is deterministic by harness, session, source, byte position, and content-block index. Separate transcript/hook streams retain their own order; there is no fabricated global chronology. `sessions` counts deduplicate record IDs and correlated tool events.
 
+## Trajectory feedback: oracle versus candidate
+
+`compare` evaluates one candidate session against one oracle session. It uses **Lance's native inverted index and BM25 search** to retrieve similar oracle steps, then computes a maximum-weight, monotonic, one-to-one alignment. This preserves chronological order while allowing unmatched steps on either side. BM25 similarity is a retrieval signal, not a reward.
+
+The default judge is [TypeSafe Jev `jev-1.13.0`](https://docs.typesafe.ai/models), using its [native Choice API](https://docs.typesafe.ai/api) with options `0` and `1`. Its selected option becomes the binary reward; probabilities, confidence, actual provider model, and usage are preserved. Jev does not generate explanations: its stored rationale identifies the typed decision, and the report model supplies the analysis. The default reporter is [Claude Opus 5.5 (`claude-opus-5-5`)](https://platform.claude.com/docs/en/models/opus-5-5/overview), through Anthropic's Messages API. Configure either model independently in TOML.
+
+```sh
+# Import both tasks first, then inspect their session IDs.
+harness-durable sessions
+
+# Local alignment preview: no credentials and no inference requests.
+harness-durable compare \
+  --oracle-session ORACLE_ID --candidate-session CANDIDATE_ID \
+  --output ./comparison --dry-run > alignment.json
+
+# Set TYPESAFE_API_KEY and ANTHROPIC_API_KEY in your environment.
+# This command sends the selected session evidence to the configured providers.
+harness-durable compare \
+  --oracle-session ORACLE_ID --candidate-session CANDIDATE_ID \
+  --output ./comparison
+
+# Native Lance reward/report events can be queried with the regular CLI.
+harness-durable query --archive ./comparison/archive \
+  --kind feedback_reward --format jsonl
+```
+
+A step is an assistant message content block or a tool call with its available, correlated tool results. An orphan tool result remains a separate step. User prompts, reasoning, compaction, metadata, and unknown events remain in the evaluation context but are not independently rewarded. Repeated identical messages at different positions remain separate steps.
+
+Every candidate step receives one binary judgment, including unmatched steps; a valid alternative approach can earn `1` without a lexical match. **Mean reward = sum of candidate step rewards / number of candidate steps.** Unmatched oracle steps are listed separately and analyzed in the report; they do not add implicit zeroes to this denominator. The mean measures candidate step quality, not oracle coverage or independently verified task success. Empty trajectories fail rather than receiving a fabricated score.
+
+Each judge request receives the candidate step, its matched oracle step, and chronological event prefixes through those steps (including attached tool results), without later outcomes. Unmatched steps receive oracle context through the preceding match, if any. The report receives both complete trajectories, rewards, the computed mean, unmatched oracle steps, and observed final outputs. By default, final output is the trailing assistant message, if there is one after the last user/tool event. This is labeled as an observation, never proof of completion. `--oracle-output FILE` and `--candidate-output FILE` supply explicit UTF-8 final outputs when needed. Missing final output stays absent.
+
+Additional selection options:
+
+- `--oracle-harness` / `--candidate-harness` disambiguate IDs across harnesses.
+- `--oracle-archive DIR` / `--candidate-archive DIR` read standalone Lance exports.
+- `--oracle-remote NAME` / `--candidate-remote NAME` read committed remote archives through the existing local cache.
+- `--oracle-leaf ENTRY_ID` / `--candidate-leaf ENTRY_ID` choose Pi branch ancestry. Branched sessions require a selection; sibling branches are never blended.
+
+Within one source, byte position and content-block index determine chronology. Multiple source streams require timestamps for every selected event; absent cross-source chronology is reported as an error instead of invented. Equal timestamps use source ID and source position as a deterministic tie-breaker.
+
+Results in `--output`:
+
+- `plan.json`: input snapshots, event IDs, rubric, model configuration without credentials, BM25 alignment, and content-derived comparison ID.
+- `evaluation.json`: durable checkpoint, binary judgments, provider responses, mean, and generated report.
+- `report.md`: the report for reading or sharing.
+- `archive/records.lance`, `archive/events.lance`, and `archive/manifest.json`: standalone, checksummed Lance archive with `feedback_reward` and `feedback_report` events. Scores and source event references live in `payload_json`.
+
+Repeat the identical command to resume. Completed judgments are reused after a judge/report outage; a different input, rubric, or model configuration requires a new output directory. Invalid responses and failed requests never become zero rewards. Partial runs have no published Lance archive. Two processes cannot write the same evaluation directory concurrently. Feedback artifacts are separate from the captured-session spool and are not automatically synchronized to cloud destinations.
+
+The default limits are 2,000 steps per trajectory and 1 MiB per model input. Inputs are not silently truncated. Provider token limits still apply (Jev has a smaller context than Opus); an oversized input fails with completed judgments preserved. Both model calls have a 120-second timeout and bounded retries for connection failures, timeouts, rate limits, and server errors. Live provider tests require credentials; routine tests use synthetic evidence and local mock servers.
+
 ## Configuration
 
 See [config.example.toml](config.example.toml). By default the configuration is `~/.harness-durable/config.toml`, and state is stored in `~/.harness-durable`. `--config` overrides the configuration location; `--state-dir` overrides storage only. Paths are literal and do not expand shell variables or `~`.

@@ -2478,6 +2478,7 @@ dependencies = [
  "futures",
  "lance",
  "lance-file",
+ "lance-index",
  "notify",
  "object_store 0.14.2",
  "reqwest 0.12.28",

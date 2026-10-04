@@ -4,7 +4,8 @@ use harness_durable::{
     adapters::{self, Source},
     archive,
     config::Config,
-    hooks,
+    feedback, hooks,
+    llm::HttpModel,
     model::Query,
     remote,
     state::State,
@@ -41,6 +42,8 @@ enum Command {
     Status,
     Sessions(ReadOptions),
     Query(ReadOptions),
+    /// Compare a candidate trajectory against an oracle using Lance BM25 and model judges.
+    Compare(Box<Compare>),
     Export {
         #[command(flatten)]
         read: ReadOptions,
@@ -51,6 +54,41 @@ enum Command {
         #[command(subcommand)]
         command: HookCommand,
     },
+}
+#[derive(Args)]
+struct Compare {
+    #[arg(long)]
+    oracle_session: String,
+    #[arg(long)]
+    candidate_session: String,
+    #[arg(long)]
+    oracle_harness: Option<String>,
+    #[arg(long)]
+    candidate_harness: Option<String>,
+    /// Read a standalone export/archive instead of the local collector.
+    #[arg(long, conflicts_with = "oracle_remote")]
+    oracle_archive: Option<PathBuf>,
+    #[arg(long, conflicts_with = "candidate_remote")]
+    candidate_archive: Option<PathBuf>,
+    #[arg(long)]
+    oracle_remote: Option<String>,
+    #[arg(long)]
+    candidate_remote: Option<String>,
+    /// Native Pi entry ID identifying the chosen branch.
+    #[arg(long)]
+    oracle_leaf: Option<String>,
+    #[arg(long)]
+    candidate_leaf: Option<String>,
+    /// UTF-8 file containing an explicit final output.
+    #[arg(long)]
+    oracle_output: Option<PathBuf>,
+    #[arg(long)]
+    candidate_output: Option<PathBuf>,
+    #[arg(long)]
+    output: PathBuf,
+    /// Print the alignment as JSON without model calls or writing evaluation files.
+    #[arg(long)]
+    dry_run: bool,
 }
 #[derive(Args, Default)]
 struct Capture {
@@ -64,6 +102,9 @@ struct Capture {
 }
 #[derive(Args, Default)]
 struct ReadOptions {
+    /// Read a standalone archive, including a comparison's archive/ directory.
+    #[arg(long, conflicts_with = "remote")]
+    archive: Option<PathBuf>,
     #[arg(long)]
     remote: Option<String>,
     #[arg(long)]
@@ -266,7 +307,9 @@ fn query_options(r: &ReadOptions) -> Result<Query> {
     Ok(q)
 }
 async fn paths(state: &State, c: &Config, r: &ReadOptions, q: &Query) -> Result<Vec<PathBuf>> {
-    if let Some(name) = &r.remote {
+    if let Some(directory) = &r.archive {
+        Ok(vec![absolute(directory)?])
+    } else if let Some(name) = &r.remote {
         let remote = c
             .remotes
             .iter()
@@ -322,7 +365,11 @@ async fn main() -> Result<()> {
     }
     let readonly = matches!(
         cli.command,
-        Command::Status | Command::Query(_) | Command::Sessions(_) | Command::Export { .. }
+        Command::Status
+            | Command::Query(_)
+            | Command::Sessions(_)
+            | Command::Export { .. }
+            | Command::Compare(_)
     );
     let mut state = if readonly && c.state_dir.join("state.sqlite").exists() {
         State::open_reader(&c.state_dir)?
@@ -330,6 +377,83 @@ async fn main() -> Result<()> {
         State::open(&c.state_dir)?
     };
     match cli.command {
+        Command::Compare(args) => {
+            let mut trajectories = Vec::new();
+            for (session, harness, directory, remote, leaf, final_output) in [
+                (
+                    &args.oracle_session,
+                    &args.oracle_harness,
+                    &args.oracle_archive,
+                    &args.oracle_remote,
+                    &args.oracle_leaf,
+                    &args.oracle_output,
+                ),
+                (
+                    &args.candidate_session,
+                    &args.candidate_harness,
+                    &args.candidate_archive,
+                    &args.candidate_remote,
+                    &args.candidate_leaf,
+                    &args.candidate_output,
+                ),
+            ] {
+                let q = Query {
+                    session: Some(session.clone()),
+                    harness: harness.clone(),
+                    ..Query::default()
+                };
+                let p = if let Some(directory) = directory {
+                    vec![absolute(directory)?]
+                } else {
+                    paths(
+                        &state,
+                        &c,
+                        &ReadOptions {
+                            remote: remote.clone(),
+                            ..ReadOptions::default()
+                        },
+                        &q,
+                    )
+                    .await?
+                };
+                trajectories.push(feedback::trajectory(
+                    archive::query(&p, &q).await?,
+                    leaf.as_deref(),
+                    final_output
+                        .as_ref()
+                        .map(std::fs::read_to_string)
+                        .transpose()?,
+                )?);
+            }
+            let candidate = trajectories.pop().unwrap();
+            let oracle = trajectories.pop().unwrap();
+            let plan = feedback::plan(oracle, candidate, c.feedback.clone()).await?;
+            if args.dry_run {
+                println!("{}", serde_json::to_string_pretty(&plan)?);
+            } else {
+                let judge = HttpModel::new(
+                    c.feedback
+                        .judge
+                        .clone()
+                        .context("configure feedback.judge")?,
+                )?;
+                let reporter = HttpModel::new(
+                    c.feedback
+                        .reporter
+                        .clone()
+                        .context("configure feedback.reporter")?,
+                )?;
+                let output = absolute(&args.output)?;
+                let result = feedback::evaluate(&plan, &output, &judge, &reporter).await?;
+                println!(
+                    "Mean reward: {:.6} ({} steps)\nReport: {}\nLance archive: {}",
+                    result.mean_reward.unwrap(),
+                    result.scores.len(),
+                    output.join("report.md").display(),
+                    output.join("archive").display()
+                );
+            }
+        }
         Command::Import(args) => {
             let count = capture_once(&mut state, &c, &args).await?;
             flush_all(&mut state, &c).await?;

@@ -30,3 +30,27 @@ rescan_seconds = 30
 # url = "https://harness-durable.YOUR-SUBDOMAIN.workers.dev"
 # archive = "personal"
 # token_env = "HARNESS_DURABLE_TOKEN"
+
+# Optional trajectory feedback. Defaults use native Jev decisions and Opus reports.
+# `compare --dry-run` aligns locally without API keys or model requests.
+# [feedback]
+# min_similarity = 0.1
+# max_steps = 2000
+# max_prompt_bytes = 1048576
+# rubric = "Correctness, useful progress, and consistency with observed evidence."
+#
+# [feedback.judge]
+# protocol = "typesafe"
+# endpoint = "https://api.typesafe.ai/v1/systemone"
+# model = "jev-1.13.0"
+# token_env = "TYPESAFE_API_KEY"
+#
+# [feedback.reporter]
+# protocol = "anthropic"
+# endpoint = "https://api.anthropic.com/v1/messages"
+# model = "claude-opus-5-5"
+# token_env = "ANTHROPIC_API_KEY"
+# max_tokens = 16384
+#
+# Other text judges/reporters can use protocol = "chat_completions" and a full
+# /v1/chat/completions endpoint. `typesafe` is supported only as the judge.

@@ -12,6 +12,7 @@ pub struct Config {
     pub rescan_seconds: u64,
     pub sources: Vec<SourceConfig>,
     pub remotes: Vec<RemoteConfig>,
+    pub feedback: crate::feedback::FeedbackConfig,
 }
 
 impl Default for Config {
@@ -25,6 +26,7 @@ impl Default for Config {
             rescan_seconds: 30,
             sources: vec![],
             remotes: vec![],
+            feedback: crate::feedback::FeedbackConfig::default(),
         }
     }
 }
@@ -87,6 +89,7 @@ impl Config {
             "batch and scan thresholds must be positive"
         );
         let mut names = std::collections::HashSet::new();
+        config.feedback.validate()?;
         for source in &config.sources {
             crate::adapters::adapter(&source.harness)?;
         }
