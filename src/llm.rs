@@ -51,6 +51,22 @@ impl ModelConfig {
     }
 }
 
+/// Every judge prompt ends with a JSON response format that starts with this text.
+/// The Typesafe protocol has its own typed answer, so it sends only the text before it.
+pub const RESPONSE_FORMAT_MARKER: &str = " Return ONLY";
+
+/// The judge instructions without the JSON response format.
+pub fn choice_instructions(system: &str) -> Result<&str> {
+    let (instructions, _) = system.split_once(RESPONSE_FORMAT_MARKER).with_context(|| {
+        format!("judge prompt must contain the response format marker {RESPONSE_FORMAT_MARKER:?}")
+    })?;
+    ensure!(
+        !instructions.trim().is_empty(),
+        "judge prompt has no instructions before the response format"
+    );
+    Ok(instructions)
+}
+
 #[async_trait::async_trait]
 pub trait LanguageModel: Send + Sync {
     async fn complete(&self, system: &str, input: &Value) -> Result<String>;
@@ -102,7 +118,7 @@ impl LanguageModel for HttpModel {
                 "messages":[{"role":"user","content":input_text}]})
             }
             Protocol::Typesafe => json!({"model":c.model,"state":input,"questions":{"reward":{
-                "type":"choice", "instructions":system.split(" Return ONLY").next().unwrap_or(system),
+                "type":"choice", "instructions":choice_instructions(system)?,
                 "criteria":{"0":"The supplied evaluation criterion is not satisfied or is unsupported by evidence.","1":"The supplied evaluation criterion is satisfied by observed evidence; accept valid alternative solutions."}}}}),
         };
         for attempt in 0..4 {

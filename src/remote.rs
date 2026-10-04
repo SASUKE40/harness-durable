@@ -94,8 +94,8 @@ impl Remote {
                 ..
             } => {
                 ensure!(
-                    archive::safe_relative(archive) && !archive.contains('/'),
-                    "invalid archive ID"
+                    archive::valid_id(archive),
+                    "invalid archive ID {archive:?}: use 1-128 letters, digits, '_' or '-'"
                 );
                 let parsed = reqwest::Url::parse(url)?;
                 ensure!(
@@ -226,18 +226,53 @@ impl Remote {
         Ok(())
     }
     pub async fn list(&self) -> Result<Vec<Manifest>> {
+        self.list_cached(None).await
+    }
+    /// Published S3 manifests are immutable, so a cached copy replaces the GET request.
+    pub async fn list_cached(&self, cache: Option<&Path>) -> Result<Vec<Manifest>> {
         let mut result = Vec::new();
         match self {
             Self::S3 { store, prefix } => {
-                let prefix = Self::key(prefix, "");
-                let mut objects = store.list(Some(&prefix));
+                let root = Self::key(prefix, "");
+                let mut objects = store.list(Some(&root));
                 while let Some(o) = objects.try_next().await? {
-                    if o.location.as_ref().ends_with("/manifest.json") {
-                        let m: Manifest =
-                            serde_json::from_slice(&store.get(&o.location).await?.bytes().await?)?;
+                    let Some(batch) = o
+                        .location
+                        .as_ref()
+                        .strip_suffix("/manifest.json")
+                        .map(|s| s.strip_prefix(root.as_ref()).unwrap_or(s))
+                        .map(|s| s.trim_start_matches('/'))
+                    else {
+                        continue;
+                    };
+                    let cached = cache.and_then(|c| {
+                        let (collector, id) = batch.split_once('/')?;
+                        (archive::valid_id(collector) && archive::valid_id(id)).then(|| {
+                            c.join(".manifests")
+                                .join(collector)
+                                .join(format!("{id}.json"))
+                        })
+                    });
+                    if let Some(file) = &cached
+                        && let Ok(bytes) = std::fs::read(file)
+                    {
+                        let m: Manifest = serde_json::from_slice(&bytes)?;
                         validate_manifest(&m)?;
+                        ensure!(Self::batch(&m) == batch, "cached manifest conflict");
                         result.push(m);
+                        continue;
                     }
+                    let bytes = store.get(&o.location).await?.bytes().await?;
+                    let m: Manifest = serde_json::from_slice(&bytes)?;
+                    validate_manifest(&m)?;
+                    ensure!(Self::batch(&m) == batch, "manifest location mismatch");
+                    if let (Some(file), Some(cache)) = (&cached, cache) {
+                        std::fs::create_dir_all(file.parent().context("cache parent")?)?;
+                        let tmp = cache.join(format!(".tmp-{}", uuid::Uuid::new_v4()));
+                        std::fs::write(&tmp, &bytes)?;
+                        std::fs::rename(&tmp, file)?;
+                    }
+                    result.push(m);
                 }
             }
             Self::Cloudflare { .. } => {
@@ -349,13 +384,30 @@ async fn put_identical(store: &Arc<dyn ObjectStore>, key: &ObjectPath, data: &[u
     }
 }
 fn retryable(e: &anyhow::Error) -> bool {
+    use std::io::ErrorKind;
     if let Some(http) = e.downcast_ref::<reqwest::Error>() {
         return http
             .status()
             .is_none_or(|s| s.is_server_error() || s.as_u16() == 429);
     }
-    e.downcast_ref::<object_store::Error>().is_some()
-        || e.downcast_ref::<std::io::Error>().is_some()
+    if let Some(store) = e.downcast_ref::<object_store::Error>() {
+        return matches!(
+            store,
+            object_store::Error::Generic { .. } | object_store::Error::JoinError { .. }
+        );
+    }
+    e.downcast_ref::<std::io::Error>().is_some_and(|io| {
+        matches!(
+            io.kind(),
+            ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::ConnectionRefused
+                | ErrorKind::BrokenPipe
+                | ErrorKind::TimedOut
+                | ErrorKind::Interrupted
+                | ErrorKind::UnexpectedEof
+        )
+    })
 }
 pub async fn sync(state: &State, configs: &[RemoteConfig], selected: Option<&str>) -> Result<()> {
     if let Some(name) = selected {
@@ -392,7 +444,8 @@ pub async fn cached_paths(config: &RemoteConfig, root: &Path, q: &Query) -> Resu
     let remote = Remote::new(config).await?;
     let mut paths = Vec::new();
     let cache = root.join("cache").join(crate::model::hash(config.name()));
-    for m in remote.list().await? {
+    std::fs::create_dir_all(&cache)?;
+    for m in archive::active(remote.list_cached(Some(&cache)).await?) {
         if m.sessions.iter().any(|s| q.matches_session(s)) {
             paths.push(remote.download(&m, &cache).await?);
         }

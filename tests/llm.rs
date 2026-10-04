@@ -85,6 +85,10 @@ async fn jev_native_choice_retries_and_preserves_confidence() {
     assert_eq!(requests[0].1, requests[1].1);
     assert_eq!(requests[0].1["state"]["candidate"], "test");
     assert_eq!(requests[0].1["questions"]["reward"]["type"], "choice");
+    assert_eq!(
+        requests[0].1["questions"]["reward"]["instructions"],
+        "Judge evidence."
+    );
     assert!(requests[0].1.get("messages").is_none());
 }
 #[tokio::test]
@@ -113,9 +117,16 @@ async fn malformed_jev_and_unauthorized_are_errors_not_zero_rewards() {
     ])
     .await;
     let model = HttpModel::new(config(Protocol::Typesafe, endpoint)).unwrap();
-    assert!(model.complete("policy", &json!({})).await.is_err());
+    let missing = model.complete("policy", &json!({})).await.unwrap_err();
+    assert!(missing.to_string().contains("response format marker"));
+    assert!(
+        model
+            .complete("policy. Return ONLY JSON", &json!({}))
+            .await
+            .is_err()
+    );
     let error = model
-        .complete("policy", &json!({}))
+        .complete("policy. Return ONLY JSON", &json!({}))
         .await
         .unwrap_err()
         .to_string();
