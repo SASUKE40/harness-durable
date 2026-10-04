@@ -4,6 +4,9 @@ flush_seconds = 5
 max_records = 1000
 max_bytes = 8388608
 rescan_seconds = 30
+# `watch` merges small batches into batches up to compact_max_bytes.
+compact_seconds = 600
+compact_max_bytes = 134217728
 
 # Omit sources to discover the standard Codex, Pi, and Cursor directories.
 # Entries override default roots for that harness.
