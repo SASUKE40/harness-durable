@@ -103,7 +103,7 @@ impl LanguageModel for HttpModel {
             }
             Protocol::Typesafe => json!({"model":c.model,"state":input,"questions":{"reward":{
                 "type":"choice", "instructions":system.split(" Return ONLY").next().unwrap_or(system),
-                "criteria":{"0":"Incorrect, unsupported, or does not make useful progress under the supplied rubric.","1":"Correct, supported by observed evidence, and makes useful progress under the supplied rubric; valid alternative solutions are acceptable."}}}}),
+                "criteria":{"0":"The supplied evaluation criterion is not satisfied or is unsupported by evidence.","1":"The supplied evaluation criterion is satisfied by observed evidence; accept valid alternative solutions."}}}}),
         };
         for attempt in 0..4 {
             let mut req = self.client.post(&c.endpoint).json(&body);

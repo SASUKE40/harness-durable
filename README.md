@@ -94,11 +94,93 @@ Results in `--output`:
 - `plan.json`: input snapshots, event IDs, rubric, model configuration without credentials, BM25 alignment, and content-derived comparison ID.
 - `evaluation.json`: durable checkpoint, binary judgments, provider responses, mean, and generated report.
 - `report.md`: the report for reading or sharing.
-- `archive/records.lance`, `archive/events.lance`, and `archive/manifest.json`: standalone, checksummed Lance archive with `feedback_reward` and `feedback_report` events. Scores and source event references live in `payload_json`.
+- `archive/records.lance`, `archive/events.lance`, and `archive/manifest.json`: standalone, checksummed Lance archive with `feedback_reward`, `feedback_dimension`, `feedback_milestone`, `feedback_diagnostics`, and `feedback_report` events. Scores and source event references live in `payload_json`.
 
 Repeat the identical command to resume. Completed judgments are reused after a judge/report outage; a different input, rubric, or model configuration requires a new output directory. Invalid responses and failed requests never become zero rewards. Partial runs have no published Lance archive. Two processes cannot write the same evaluation directory concurrently. Feedback artifacts are separate from the captured-session spool and are not automatically synchronized to cloud destinations.
 
 The default limits are 2,000 steps per trajectory and 1 MiB per model input. Inputs are not silently truncated. Provider token limits still apply (Jev has a smaller context than Opus); an oversized input fails with completed judgments preserved. Both model calls have a 120-second timeout and bounded retries for connection failures, timeouts, rate limits, and server errors. Live provider tests require credentials; routine tests use synthetic evidence and local mock servers.
+
+## Matching, evidence, and regression checks
+
+The evaluation and recall additions are implemented directly in Rust. They do not depend on AgentEvals, OpenJudge, EvalView, or sessiongrep. The existing Cloudflare deployment service remains TypeScript.
+
+`compare --matching MODE` selects a policy:
+
+- `bm25` (comparison default): native Lance retrieval followed by chronological, one-to-one alignment.
+- `strict` (snapshot default): compare each position. Tool name and normalized JSON arguments must match; native call IDs do not have to match.
+- `unordered`: exact actions with multiset semantics. Repeated actions consume separate reference occurrences.
+- `required`: require selected oracle actions in order, allowing extra candidate actions and omitted nonrequired reference actions. Requires `required_steps` in the criteria file.
+
+Exact matching also compares message text. Regression diffs check recorded tool results as well as actions, and distinguish changed, missing, and extra steps. Strict matching intentionally treats an insertion as positional changes. BM25 aligns similar actions but does not make them equivalent for a regression gate.
+
+`--criteria FILE` on `compare` or `snapshot` supplies JSON with `required_steps`, `milestones`, and `outcome_checks`; omitted lists default to empty. See [examples/criteria.json](examples/criteria.json) and adapt its tool name and expected result to your transcripts. Oracle step numbers in criteria are **1-based**; low-level alignment JSON indices remain **0-based**.
+
+- `required_steps`: exact structural requirements, matched one-to-one in oracle order, independently of the alignment policy. BM25 overlap cannot fulfill these requirements. Use semantic milestones when alternative implementations should qualify.
+- `milestones`: each has `id`, `description`, and optional `oracle_steps` evidence hints. The judge scores achievement from the complete candidate evidence, accepting alternate tools and split/merged steps. These are task-level judgments; unlike step judgments, they can see later outcomes.
+- `outcome_checks`: deterministic `final_equals` (`expected`), `final_contains` (`text`), `tool_result_contains` (`tool`, `text`), or `artifact_sha256` (`path`, `sha256`), each with an `id`. Artifact paths must be absolute. These checks read existing evidence/files; they do not execute tests. Transcript substring checks prove only that the text was recorded. A missing final output, result, or artifact fails its configured check. No configured checks means outcome is unknown.
+
+The default evaluation now saves separate **tool correctness** and **progress** binary judgments in addition to quality. Tool correctness applies only to tool steps; progress applies to every candidate step. Their means remain separate. Required-work coverage is `(exact requirements met + semantic milestones rewarded 1) / declared requirements`; it is unknown when none are declared. Reference alignment coverage and exact-action repetition are diagnostics, not proof of success or waste. Repeated actions can be legitimate.
+
+With `N` candidate steps, `T` tool steps, and `M` semantic milestones, a default evaluation makes `2N + T + M` judge requests and one report request, excluding retries. Set `feedback.dimensions = []` for quality-only step scoring. Milestones still require their own judgments. Every successful decision is checkpointed before the next request. Comparison format is now version 2; use a new output directory for old version 1 comparisons (their published Lance archives remain readable).
+
+```sh
+# Explicitly accept a reference; snapshot does not claim the task succeeded.
+harness-durable snapshot --session ORACLE_ID --output ./baseline
+# Add an alternative accepted trajectory under the SAME policy (up to five).
+harness-durable snapshot --session ALTERNATE_ID --output ./baseline --append
+
+# Offline CI gate: no model calls. Defaults allow no missing, extra, or changed steps.
+harness-durable check --session CANDIDATE_ID \
+  --baseline ./baseline --output ./regression
+
+# Declared milestones need --judge. This sends evidence to configured providers.
+# Model configuration is pinned in the baseline; credentials come from the environment.
+harness-durable snapshot --session ORACLE_ID --criteria examples/criteria.json \
+  --output ./semantic-baseline
+harness-durable check --session CANDIDATE_ID --baseline ./semantic-baseline \
+  --output ./judged-regression --judge --min-quality 0.8 \
+  --min-tool-correctness 0.9 --min-progress 0.8 --require-outcome
+```
+
+`check` exits **0** on pass, **2** on regression, **1** on an operational error. It saves `check.json` and `check.md`, and evaluates each accepted variant independently: one whole variant must pass every gate. It never combines the best scores from different references. Baseline/check directories are locked and conflicting reuse is rejected. Commit reviewed `baseline.json` snapshots to your own repository when appropriate; they contain full session evidence, not credentials from model configuration.
+
+Optional gates: `--max-missing-steps`, `--max-extra-steps`, `--max-changed-steps`, `--min-quality`, `--min-required-coverage`, `--min-tool-correctness`, `--min-progress`, `--max-repetition-ratio`, `--require-outcome`. A requested metric that is unavailable cannot pass. Declared required steps, milestones, and outcome checks must pass independently of average-score thresholds. Without `--judge`, declared semantic milestones are reported as unjudged failures. Final-output changes also fail when no changed steps are allowed (except in `required` mode, where output requirements must be explicit). Tune change allowances when semantic equivalence is intended.
+
+For CI, import the current run into an isolated `--state-dir`, then run `check` against the reviewed baseline and retain the output directory as a build artifact. No provider credentials are needed for structural/outcome-only checks. `snapshot` and `check` also accept `--archive DIR`, `--remote NAME`, `--harness`, `--leaf`, and `--final-output FILE`.
+
+## Terminal browsing and read-only MCP recall
+
+```sh
+harness-durable browse --pair-output ./pair.json
+# Commands: list [text], next, prev, show N, oracle N, candidate N, preview, save, quit
+harness-durable compare --pair ./pair.json --output ./selected-comparison --dry-run
+
+# Start an MCP stdio server for local committed archives.
+harness-durable mcp
+# Or serve a standalone exported archive, without creating collector state.
+harness-durable mcp --archive /absolute/path/to/export
+```
+
+The browser is a portable line-oriented terminal interface. `preview` shows BM25 alignment without inference; `save` explicitly writes a pair selection and refuses overwrites. For Pi branches, supply `compare --oracle-leaf` / `--candidate-leaf`. Session text is escaped before terminal rendering.
+
+Configure your MCP client to launch `/absolute/path/to/harness-durable` with arguments `["--state-dir", "/absolute/path/to/state", "mcp"]`. The stdio server implements initialization, `tools/list`, and `tools/call` with three read-only tools: `search_sessions`, `read_session`, and `get_event`. Search is case-insensitive substring matching over text/session/harness. Reads support `offset` and `limit` (1–100), return stable event IDs, and reject ambiguous session IDs unless a harness is supplied. Oversized events return explicitly marked previews; use `query --format jsonl` to inspect full evidence. Requests and response data are bounded; queries currently materialize matching archive events before pagination. There is no network listener, remote sync, execution, or inference through MCP. Only committed local archives are visible; configure archive scope at server startup.
+
+## Judge calibration
+
+`calibrate` compares saved quality judgments with human-provided binary labels. It makes no model requests and does not generate labels.
+
+```json
+[
+  {"evaluation": "/absolute/path/to/comparison", "candidate_step": 1, "human_reward": 1},
+  {"evaluation": "/absolute/path/to/comparison", "candidate_step": 2, "human_reward": 0}
+]
+```
+
+```sh
+harness-durable calibrate --labels labels.json --output calibration.json
+```
+
+The output reports confusion counts, agreement, precision, and recall overall and grouped by judge/model/rubric configuration. Step numbers are 1-based; duplicate labels and invalid saved judgments are rejected. Undefined ratios are null. Use representative held-out labels; agreement on a small selected sample is not a general accuracy estimate. This first calibration command covers the original quality reward, not the separate dimension/milestone judgments.
 
 ## Configuration
 

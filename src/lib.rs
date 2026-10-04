@@ -1,9 +1,13 @@
 pub mod adapters;
 pub mod archive;
+pub mod assessment;
 pub mod config;
 pub mod feedback;
 pub mod hooks;
 pub mod llm;
+pub mod mcp;
 pub mod model;
+pub mod recall;
+pub mod regression;
 pub mod remote;
 pub mod state;

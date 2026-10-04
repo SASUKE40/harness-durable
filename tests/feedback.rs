@@ -11,6 +11,13 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+fn quality_only() -> FeedbackConfig {
+    FeedbackConfig {
+        dimensions: vec![],
+        ..FeedbackConfig::default()
+    }
+}
+
 fn event(session: &str, position: u64, text: &str) -> Event {
     Event {
         id: format!("{session}-{position}"),
@@ -59,7 +66,7 @@ async fn native_bm25_and_monotonic_alignment_with_unequal_lengths() {
             "deliver final output",
         ],
     );
-    let p = feedback::plan(oracle.clone(), candidate.clone(), FeedbackConfig::default())
+    let p = feedback::plan(oracle.clone(), candidate.clone(), quality_only())
         .await
         .unwrap();
     assert_eq!(
@@ -73,7 +80,7 @@ async fn native_bm25_and_monotonic_alignment_with_unequal_lengths() {
     assert!(p.alignment[0].similarity.unwrap() > 0.0);
     assert_eq!(
         p.id,
-        feedback::plan(oracle, candidate, FeedbackConfig::default())
+        feedback::plan(oracle, candidate, quality_only())
             .await
             .unwrap()
             .id
@@ -87,7 +94,7 @@ async fn native_bm25_and_monotonic_alignment_with_unequal_lengths() {
     let p = feedback::plan(
         task("o", &["alpha", "beta", "gamma"]),
         task("c", &["alpha", "gamma"]),
-        FeedbackConfig::default(),
+        quality_only(),
     )
     .await
     .unwrap();
@@ -182,7 +189,7 @@ async fn resume_mean_report_and_lance_roundtrip() {
     let p = feedback::plan(
         task("o", &["inspect file", "run tests"]),
         task("c", &["inspect file", "run tests"]),
-        FeedbackConfig::default(),
+        quality_only(),
     )
     .await
     .unwrap();
@@ -236,13 +243,9 @@ async fn resume_mean_report_and_lance_roundtrip() {
 
 #[tokio::test]
 async fn invalid_judge_and_report_outage_do_not_create_false_scores() {
-    let p = feedback::plan(
-        task("o", &["done"]),
-        task("c", &["done"]),
-        FeedbackConfig::default(),
-    )
-    .await
-    .unwrap();
+    let p = feedback::plan(task("o", &["done"]), task("c", &["done"]), quality_only())
+        .await
+        .unwrap();
     let out = tempfile::tempdir().unwrap();
     let invalid = Mock::new(&[Some("reward: yes")]);
     let no_report = Mock::new(&[None]);
@@ -322,7 +325,7 @@ async fn judging_does_not_leak_future_outcomes_and_output_lock_is_exclusive() {
     let p = feedback::plan(
         task("o", &["inspect", "later outcome"]),
         task("c", &["inspect", "later outcome"]),
-        FeedbackConfig::default(),
+        quality_only(),
     )
     .await
     .unwrap();

@@ -34,6 +34,8 @@ rescan_seconds = 30
 # Optional trajectory feedback. Defaults use native Jev decisions and Opus reports.
 # `compare --dry-run` aligns locally without API keys or model requests.
 # [feedback]
+# matching = "bm25" # bm25 | strict | unordered | required
+# dimensions = ["tool_correctness", "progress"] # [] for quality-only requests
 # min_similarity = 0.1
 # max_steps = 2000
 # max_prompt_bytes = 1048576

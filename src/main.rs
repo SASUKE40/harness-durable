@@ -3,11 +3,13 @@ use clap::{Args, Parser, Subcommand};
 use harness_durable::{
     adapters::{self, Source},
     archive,
+    assessment::{Criteria, MatchMode},
     config::Config,
     feedback, hooks,
     llm::HttpModel,
+    mcp,
     model::Query,
-    remote,
+    recall, regression, remote,
     state::State,
 };
 use notify::Watcher;
@@ -44,6 +46,29 @@ enum Command {
     Query(ReadOptions),
     /// Compare a candidate trajectory against an oracle using Lance BM25 and model judges.
     Compare(Box<Compare>),
+    /// Save an explicitly accepted reference, or append another valid path.
+    Snapshot(Box<Snapshot>),
+    /// Compare with accepted snapshots. Exit 2 on regression, 1 on an error.
+    Check(Box<Check>),
+    /// Interactive, line-oriented terminal browser; never calls a model.
+    Browse {
+        #[command(flatten)]
+        read: ReadOptions,
+        #[arg(long, default_value = "pair.json")]
+        pair_output: PathBuf,
+    },
+    /// Serve read-only local recall tools over MCP stdio.
+    Mcp {
+        #[arg(long)]
+        archive: Option<PathBuf>,
+    },
+    /// Compare saved quality judgments against explicitly supplied human labels.
+    Calibrate {
+        #[arg(long)]
+        labels: PathBuf,
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     Export {
         #[command(flatten)]
         read: ReadOptions,
@@ -57,10 +82,17 @@ enum Command {
 }
 #[derive(Args)]
 struct Compare {
+    #[arg(long, required_unless_present = "pair")]
+    oracle_session: Option<String>,
+    #[arg(long, required_unless_present = "pair")]
+    candidate_session: Option<String>,
+    #[arg(long, conflicts_with_all=["oracle_session", "candidate_session"])]
+    pair: Option<PathBuf>,
+    #[arg(long, value_enum)]
+    matching: Option<MatchMode>,
+    /// JSON file declaring required steps, semantic milestones, and outcome checks.
     #[arg(long)]
-    oracle_session: String,
-    #[arg(long)]
-    candidate_session: String,
+    criteria: Option<PathBuf>,
     #[arg(long)]
     oracle_harness: Option<String>,
     #[arg(long)]
@@ -89,6 +121,79 @@ struct Compare {
     /// Print the alignment as JSON without model calls or writing evaluation files.
     #[arg(long)]
     dry_run: bool,
+}
+#[derive(Args)]
+struct SessionInput {
+    #[arg(long)]
+    session: String,
+    #[arg(long)]
+    harness: Option<String>,
+    #[arg(long, conflicts_with = "remote")]
+    archive: Option<PathBuf>,
+    #[arg(long)]
+    remote: Option<String>,
+    #[arg(long)]
+    leaf: Option<String>,
+    #[arg(long)]
+    final_output: Option<PathBuf>,
+}
+#[derive(Args)]
+struct Snapshot {
+    #[command(flatten)]
+    input: SessionInput,
+    #[arg(long)]
+    output: PathBuf,
+    #[arg(long)]
+    append: bool,
+    #[arg(long, value_enum, default_value = "strict")]
+    matching: MatchMode,
+    #[arg(long)]
+    criteria: Option<PathBuf>,
+}
+#[derive(Args)]
+struct Check {
+    #[command(flatten)]
+    input: SessionInput,
+    #[arg(long)]
+    baseline: PathBuf,
+    #[arg(long)]
+    output: PathBuf,
+    /// Explicitly enable paid/provider inference for quality and semantic milestones.
+    #[arg(long)]
+    judge: bool,
+    #[command(flatten)]
+    gates: regression::Gates,
+}
+fn criteria_file(path: &Option<PathBuf>, config: &mut feedback::FeedbackConfig) -> Result<()> {
+    if let Some(path) = path {
+        config.criteria = serde_json::from_slice::<Criteria>(&std::fs::read(path)?)?;
+    }
+    Ok(())
+}
+async fn session_input(
+    state: &State,
+    c: &Config,
+    input: &SessionInput,
+) -> Result<feedback::Trajectory> {
+    let q = Query {
+        session: Some(input.session.clone()),
+        harness: input.harness.clone(),
+        ..Query::default()
+    };
+    let read = ReadOptions {
+        archive: input.archive.clone(),
+        remote: input.remote.clone(),
+        ..ReadOptions::default()
+    };
+    feedback::trajectory(
+        archive::query(&paths(state, c, &read, &q).await?, &q).await?,
+        input.leaf.as_deref(),
+        input
+            .final_output
+            .as_ref()
+            .map(std::fs::read_to_string)
+            .transpose()?,
+    )
 }
 #[derive(Args, Default)]
 struct Capture {
@@ -363,6 +468,29 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
+    if let Command::Mcp { archive } = &cli.command {
+        let mut server = mcp::Server::new(
+            c.state_dir.clone(),
+            archive.as_ref().map(|p| absolute(p)).transpose()?,
+        );
+        mcp::serve(
+            &mut server,
+            &mut std::io::stdin().lock(),
+            &mut std::io::stdout().lock(),
+        )
+        .await?;
+        return Ok(());
+    }
+    if let Command::Calibrate { labels, output } = &cli.command {
+        let labels: Vec<regression::HumanLabel> = serde_json::from_slice(&std::fs::read(labels)?)?;
+        let result = regression::calibrate(&labels)?;
+        let bytes = serde_json::to_vec_pretty(&result)?;
+        if let Some(path) = output {
+            std::fs::write(path, &bytes)?;
+        }
+        println!("{}", String::from_utf8(bytes)?);
+        return Ok(());
+    }
     let readonly = matches!(
         cli.command,
         Command::Status
@@ -370,6 +498,9 @@ async fn main() -> Result<()> {
             | Command::Sessions(_)
             | Command::Export { .. }
             | Command::Compare(_)
+            | Command::Snapshot(_)
+            | Command::Check(_)
+            | Command::Browse { .. }
     );
     let mut state = if readonly && c.state_dir.join("state.sqlite").exists() {
         State::open_reader(&c.state_dir)?
@@ -377,7 +508,102 @@ async fn main() -> Result<()> {
         State::open(&c.state_dir)?
     };
     match cli.command {
-        Command::Compare(args) => {
+        Command::Snapshot(args) => {
+            let trajectory = session_input(&state, &c, &args.input).await?;
+            let mut config = c.feedback.clone();
+            config.matching = args.matching;
+            criteria_file(&args.criteria, &mut config)?;
+            let result =
+                regression::snapshot(&absolute(&args.output)?, trajectory, config, args.append)?;
+            println!(
+                "Accepted {} reference variant(s): {}",
+                result.variants.len(),
+                absolute(&args.output)?.display()
+            );
+        }
+        Command::Check(args) => {
+            let baseline = regression::load(&absolute(&args.baseline)?)?;
+            let candidate = session_input(&state, &c, &args.input).await?;
+            let models = if args.judge {
+                Some((
+                    HttpModel::new(
+                        baseline
+                            .config
+                            .judge
+                            .clone()
+                            .context("configure feedback.judge")?,
+                    )?,
+                    HttpModel::new(
+                        baseline
+                            .config
+                            .reporter
+                            .clone()
+                            .context("configure feedback.reporter")?,
+                    )?,
+                ))
+            } else {
+                None
+            };
+            let result = regression::check(
+                &baseline,
+                candidate,
+                args.gates,
+                &absolute(&args.output)?,
+                models.as_ref().map(|(j, r)| {
+                    (
+                        j as &dyn harness_durable::llm::LanguageModel,
+                        r as &dyn harness_durable::llm::LanguageModel,
+                    )
+                }),
+            )
+            .await?;
+            println!(
+                "{} — {}\n{}",
+                if result.passed { "PASS" } else { "FAIL" },
+                result.candidate_session,
+                absolute(&args.output)?.join("check.json").display()
+            );
+            if !result.passed {
+                std::process::exit(2);
+            }
+        }
+        Command::Browse { read, pair_output } => {
+            let q = query_options(&read)?;
+            let events = archive::query(&paths(&state, &c, &read, &q).await?, &q).await?;
+            recall::browse(
+                &events,
+                read.archive.as_ref().map(|p| absolute(p)).transpose()?,
+                read.remote,
+                &absolute(&pair_output)?,
+                &mut std::io::stdin().lock(),
+                &mut std::io::stdout().lock(),
+            )
+            .await?;
+        }
+        Command::Compare(mut args) => {
+            if let Some(path) = &args.pair {
+                let pair: recall::Pair = serde_json::from_slice(&std::fs::read(path)?)?;
+                ensure!(
+                    pair.archive.is_none() || pair.remote.is_none(),
+                    "pair cannot specify both archive and remote"
+                );
+                args.oracle_session = Some(pair.oracle_session);
+                args.candidate_session = Some(pair.candidate_session);
+                args.oracle_harness.get_or_insert(pair.oracle_harness);
+                args.candidate_harness.get_or_insert(pair.candidate_harness);
+                if args.oracle_archive.is_none() && args.oracle_remote.is_none() {
+                    args.oracle_archive = pair.archive.clone();
+                    args.oracle_remote = pair.remote.clone();
+                }
+                if args.candidate_archive.is_none() && args.candidate_remote.is_none() {
+                    args.candidate_archive = pair.archive;
+                    args.candidate_remote = pair.remote;
+                }
+            }
+            if let Some(mode) = args.matching {
+                c.feedback.matching = mode;
+            }
+            criteria_file(&args.criteria, &mut c.feedback)?;
             let mut trajectories = Vec::new();
             for (session, harness, directory, remote, leaf, final_output) in [
                 (
@@ -398,7 +624,7 @@ async fn main() -> Result<()> {
                 ),
             ] {
                 let q = Query {
-                    session: Some(session.clone()),
+                    session: Some(session.clone().context("session must be selected")?),
                     harness: harness.clone(),
                     ..Query::default()
                 };
@@ -451,6 +677,13 @@ async fn main() -> Result<()> {
                     result.scores.len(),
                     output.join("report.md").display(),
                     output.join("archive").display()
+                );
+                println!(
+                    "Reference coverage: {:.4}\nRequired-work coverage: {:?}\nOutcome checks passed: {:?}\nDimensions: {}",
+                    plan.diagnostics.reference_step_coverage,
+                    result.required_work_coverage,
+                    plan.diagnostics.outcome_passed,
+                    serde_json::to_string(&result.dimension_means)?
                 );
             }
         }
@@ -557,7 +790,10 @@ async fn main() -> Result<()> {
             .await?;
             println!("{}", output.display());
         }
-        Command::Discover(_) | Command::Hooks { .. } => unreachable!(),
+        Command::Discover(_)
+        | Command::Hooks { .. }
+        | Command::Mcp { .. }
+        | Command::Calibrate { .. } => unreachable!(),
     }
     Ok(())
 }

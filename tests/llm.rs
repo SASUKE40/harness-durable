@@ -153,7 +153,7 @@ async fn cli_compares_imported_sessions_through_jev_and_opus() {
     );
     let (endpoint,requests,server)=server(vec![(200,jev("1")),(200,json!({"stop_reason":"end_turn","content":[{"type":"text","text":"# Evaluation\nMean 1.0. Final output matches."}]}))]).await;
     let configuration = tmp.path().join("config.toml");
-    std::fs::write(&configuration,format!("[feedback.judge]\nprotocol='typesafe'\nendpoint='{endpoint}'\nmodel='jev-1.13.0'\ntoken_env='HARNESS_MOCK_JEV_KEY'\n[feedback.reporter]\nprotocol='anthropic'\nendpoint='{endpoint}'\nmodel='claude-opus-5-5'\ntoken_env='HARNESS_MOCK_OPUS_KEY'\n")).unwrap();
+    std::fs::write(&configuration,format!("[feedback]\ndimensions=[]\n[feedback.judge]\nprotocol='typesafe'\nendpoint='{endpoint}'\nmodel='jev-1.13.0'\ntoken_env='HARNESS_MOCK_JEV_KEY'\n[feedback.reporter]\nprotocol='anthropic'\nendpoint='{endpoint}'\nmodel='claude-opus-5-5'\ntoken_env='HARNESS_MOCK_OPUS_KEY'\n")).unwrap();
     let output = tmp.path().join("evaluation");
     let mut command = std::process::Command::new(binary);
     command

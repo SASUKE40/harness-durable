@@ -1,0 +1,18 @@
+{
+  "required_steps": [],
+  "milestones": [
+    {
+      "id": "regression-tested",
+      "description": "A regression test exercises the requested fix and its observed result passes. Accept equivalent testing tools and alternate implementations.",
+      "oracle_steps": []
+    }
+  ],
+  "outcome_checks": [
+    {
+      "kind": "tool_result_contains",
+      "id": "test-result",
+      "tool": "exec_command",
+      "text": "test result: ok"
+    }
+  ]
+}
