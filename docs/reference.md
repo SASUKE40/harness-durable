@@ -1,6 +1,6 @@
-# Harness Durable
+# Harness Durable reference
 
-Capture Codex, Pi, and Cursor sessions into portable, native [Lance](https://github.com/lance-format/lance) datasets. Import existing history, watch active sessions, and synchronize archives to S3 or Cloudflare R2 with Durable Objects.
+This is the full reference. For an overview and the data-flow diagram, see the [README](../README.md).
 
 The collector and query engine are Rust. Cloudflare runs a small TypeScript service that stores files in R2 and publication metadata in a SQLite-backed Durable Object. No Lance runtime or conversion runs inside a Worker.
 
@@ -42,11 +42,12 @@ harness-durable query --session SESSION_ID --kind message
 harness-durable query --harness pi --text "error" \
   --since 2026-10-01T00:00:00Z --until 2026-10-02T00:00:00Z --format jsonl
 harness-durable export --session SESSION_ID --output /tmp/session-export
+harness-durable compact
 ```
 
 The export directory contains `records.lance`, `events.lance`, and `manifest.json`. Both `.lance` directories are standalone datasets readable with official Lance tooling, for example `lance.dataset("/tmp/session-export/events.lance")` in Python. Export destinations must not already exist.
 
-Query filters are optional and intersect. Text matching is case-sensitive substring matching. Timestamps are optional UTC RFC3339 strings normalized to milliseconds; time filters exclude events whose source has no timestamp. Ordering is deterministic by harness, session, source, byte position, and content-block index. Separate transcript/hook streams retain their own order; there is no fabricated global chronology. `sessions` counts deduplicate record IDs and correlated tool events.
+Query filters are optional and intersect. Harness, session, kind, text, and time filters run inside the Lance scan, and results stream one session at a time. Text matching is case-sensitive substring matching. Timestamps are optional UTC RFC3339 strings normalized to milliseconds; time filters exclude events whose source has no timestamp. Ordering is deterministic by harness, session, source, byte position, and content-block index. Separate transcript/hook streams retain their own order; there is no fabricated global chronology. `sessions` counts deduplicate record IDs and correlated tool events.
 
 ## Trajectory feedback: oracle versus candidate
 
@@ -113,7 +114,7 @@ The evaluation and recall additions are implemented directly in Rust. They do no
 
 Exact matching also compares message text. Regression diffs check recorded tool results as well as actions, and distinguish changed, missing, and extra steps. Strict matching intentionally treats an insertion as positional changes. BM25 aligns similar actions but does not make them equivalent for a regression gate.
 
-`--criteria FILE` on `compare` or `snapshot` supplies JSON with `required_steps`, `milestones`, and `outcome_checks`; omitted lists default to empty. See [examples/criteria.json](examples/criteria.json) and adapt its tool name and expected result to your transcripts. Oracle step numbers in criteria are **1-based**; low-level alignment JSON indices remain **0-based**.
+`--criteria FILE` on `compare` or `snapshot` supplies JSON with `required_steps`, `milestones`, and `outcome_checks`; omitted lists default to empty. See [examples/criteria.json](../examples/criteria.json) and adapt its tool name and expected result to your transcripts. Oracle step numbers in criteria are **1-based**; low-level alignment JSON indices remain **0-based**.
 
 - `required_steps`: exact structural requirements, matched one-to-one in oracle order, independently of the alignment policy. BM25 overlap cannot fulfill these requirements. Use semantic milestones when alternative implementations should qualify.
 - `milestones`: each has `id`, `description`, and optional `oracle_steps` evidence hints. The judge scores achievement from the complete candidate evidence, accepting alternate tools and split/merged steps. These are task-level judgments; unlike step judgments, they can see later outcomes.
@@ -163,7 +164,7 @@ harness-durable mcp --archive /absolute/path/to/export
 
 The browser is a portable line-oriented terminal interface. `preview` shows BM25 alignment without inference; `save` explicitly writes a pair selection and refuses overwrites. For Pi branches, supply `compare --oracle-leaf` / `--candidate-leaf`. Session text is escaped before terminal rendering.
 
-Configure your MCP client to launch `/absolute/path/to/harness-durable` with arguments `["--state-dir", "/absolute/path/to/state", "mcp"]`. The stdio server implements initialization, `tools/list`, and `tools/call` with three read-only tools: `search_sessions`, `read_session`, and `get_event`. Search is case-insensitive substring matching over text/session/harness. Reads support `offset` and `limit` (1–100), return stable event IDs, and reject ambiguous session IDs unless a harness is supplied. Oversized events return explicitly marked previews; use `query --format jsonl` to inspect full evidence. Requests and response data are bounded; queries currently materialize matching archive events before pagination. There is no network listener, remote sync, execution, or inference through MCP. Only committed local archives are visible; configure archive scope at server startup.
+Configure your MCP client to launch `/absolute/path/to/harness-durable` with arguments `["--state-dir", "/absolute/path/to/state", "mcp"]`. The stdio server implements initialization, `tools/list`, and `tools/call` with three read-only tools: `search_sessions`, `read_session`, and `get_event`. Search is case-insensitive substring matching over text/session/harness. Reads support `offset` and `limit` (1–100), return stable event IDs, and reject ambiguous session IDs unless a harness is supplied. Oversized events return explicitly marked previews; use `query --format jsonl` to inspect full evidence. Requests and response data are bounded. Search keeps only bounded summaries per session, and `get_event` looks up one event ID in Lance. There is no network listener, remote sync, execution, or inference through MCP. Only committed local archives are visible; configure archive scope at server startup.
 
 ## Judge calibration
 
@@ -248,7 +249,7 @@ The script uses an isolated temporary state directory and explicitly marks its a
 
 ## Configuration
 
-See [config.example.toml](config.example.toml). By default the configuration is `~/.harness-durable/config.toml`, and state is stored in `~/.harness-durable`. `--config` overrides the configuration location; `--state-dir` overrides storage only. Paths are literal and do not expand shell variables or `~`.
+See [config.example.toml](../config.example.toml). By default the configuration is `~/.harness-durable/config.toml`, and state is stored in `~/.harness-durable`. `--config` overrides the configuration location and the file must exist; `--state-dir` overrides storage only. Paths are literal and do not expand shell variables or `~`. All size and time thresholds must be positive.
 
 Default discovery roots:
 
@@ -273,7 +274,7 @@ harness-durable hooks uninstall cursor
 
 Installation uses the current executable's absolute path, so install the binary in a permanent location first. Default configuration is `~/.cursor/hooks.json`; use `--hooks-file PATH` for a different scope. The installer adds `sessionStart`, `sessionEnd`, `postToolUse`, and `postToolUseFailure` entries and records ownership next to the config. Uninstallation removes only unchanged entries owned by this installation, preserving unrelated hooks and settings.
 
-The hidden `hooks receive` command accepts Cursor's JSON on stdin, writes an immutable local spool item, and emits `{}`. It makes no network request and fails open. The original stdin bytes are retained alongside compact JSONL; the archive's raw record uses the original bytes. Repeated deliveries remain in the raw archive, while matching `(harness, session, kind, tool-call ID)` events are collapsed in query results, preferring transcript events.
+The hidden `hooks receive` command accepts Cursor's JSON on stdin, writes an immutable local spool item, and emits `{}`. It makes no network request and fails open. The original stdin bytes are retained alongside compact JSONL; the archive's raw record uses the original bytes. Repeated deliveries remain in the raw archive, while matching `(harness, session, kind, tool-call ID)` events are collapsed in query results, preferring transcript events. An event counts as a hook event only when its payload has a top-level `hook_event_name`. After a spool item is published and nothing is pending, the collector deletes the spool files.
 
 For CLI capture, save Cursor's structured output using its documented `--print --output-format stream-json` options and import/watch that file. Streaming deltas are classified separately from complete assistant messages; terminal result summaries are lifecycle events. The collector does not launch or control the harness.
 
@@ -335,7 +336,7 @@ The API requires `Authorization: Bearer TOKEN`. All routes begin `/v1/archives/{
 - `GET /sessions?after=CURSOR` lists committed per-batch session summaries. The CLI computes deduplicated counts from Lance data.
 - `GET /batches/{collector}/{batch}/files/{relative-path}` downloads a published file; unpublished files return 404.
 
-Metadata requests are limited to 1 MiB and 10,000 files/sessions per manifest. Dataset uploads stream through the Worker; normal Cloudflare request-size limits still apply. One Durable Object coordinates each archive. R2 writes verify content before SQLite marks files uploaded. Publication and session metadata update atomically in SQLite.
+Collector, batch, and archive IDs use 1–128 letters, digits, `_`, or `-`. The Rust collector and the Worker apply the same manifest rules, and `tests/fixtures/manifests.json` tests both. Metadata requests are limited to 1 MiB and 10,000 files/sessions per manifest. Dataset files stream between the Worker and R2 directly; the Durable Object only records which files are verified. normal Cloudflare request-size limits still apply. One Durable Object coordinates each archive. R2 writes verify content before SQLite marks files uploaded. Publication and session metadata update atomically in SQLite.
 
 ## Durability and format
 
@@ -348,11 +349,15 @@ All other columns are UTF-8. `payload_json` preserves structured normalized cont
 
 SQLite uses WAL and FULL synchronization. Source checkpoints, seen IDs, and pending records commit together. Batch files and directories are synchronized before atomic publication; pending payloads are removed only after the batch is registered in SQLite. A crash after publication reuses the deterministic batch ID. The compact seen-ID catalog is retained to make repeated imports idempotent.
 
-The watcher combines filesystem notifications with 30-second rescans. Batches flush after 5 seconds, 1,000 records, or 8 MiB; one oversized record is kept intact. Network transfers run separately, retry transient upload failures with bounded backoff, and leave failed uploads pending. Ctrl-C flushes local records and cancels outstanding transfers safely; use `sync` to drain the backlog. `status`, `sessions`, `query`, and `export` can read published batches during watch. Only one writer uses each state directory.
+The watcher combines filesystem notifications with 30-second rescans. A rescan skips a file without opening it when its identity, size, and modification time match the checkpoint and it has not changed for 2 seconds. Batches flush after 5 seconds, 1,000 records, or 8 MiB; one oversized record is kept intact. Pending raw bytes are stored as a SQLite BLOB. Network transfers run separately, retry transient upload failures with bounded backoff, and leave failed uploads pending. Ctrl-C flushes local records and cancels outstanding transfers safely; use `sync` to drain the backlog. `status`, `sessions`, `query`, and `export` can read published batches during watch. Only one writer uses each state directory.
 
 Renames, replaced files, truncation, and changed checkpoint boundaries trigger replay with deterministic deduplication. A trailing line without a newline is deferred until the writer completes it. Sources are treated as append-only between checkpoints; arbitrary edits deep inside a previously consumed file should be reimported using a fresh state directory. Raw IDs distinguish equal content at different source positions.
 
-Remote queries list committed manifests, select relevant sessions, download and checksum-verify datasets into a local cache, and scan them with Lance. Queries do not execute on the Worker. This initial version favors inspectable immutable batches over automatic compaction; use `export` for a consolidated dataset.
+Remote queries list committed manifests, select relevant sessions, download and checksum-verify datasets into a local cache, and scan them with Lance. Queries do not execute on the Worker. S3 manifests are cached locally, so a repeated listing downloads only new manifests.
+
+### Compaction
+
+Many small batches make queries slow. `compact` (and `watch`, every `compact_seconds`, default 600, between uploads) merges consecutive small batches into one batch up to `compact_max_bytes` (default 128 MiB). The new batch is immutable, has a deterministic ID, and lists the merged batch IDs in `manifest.json` under `replaces`. Local and remote readers ignore replaced batches. `sync` uploads the merged batch; remote copies of older batches stay, and readers skip them. The local files of replaced batches are deleted after 5 minutes, so running readers can finish. Startup removes abandoned `.tmp-*` directories.
 
 ## Tests
 
@@ -374,4 +379,4 @@ For Rust-to-Worker integration, run `npx wrangler dev --var API_TOKEN:test-token
 
 ## Boundaries
 
-V1 archives and queries locally available JSONL/NDJSON sessions; it does not restore harness state, translate sessions between harnesses, scrape private Cursor databases, or claim coverage of remote-only/compressed proprietary history. Missing timestamps/results remain missing. External attachment URLs are preserved, not fetched. There is no automatic redaction: raw session text and tool outputs are intentionally retained. Remote synchronization begins only after you configure a destination. Retention/deletion, team identities, a web UI, and semantic search are outside this release.
+V1 archives and queries locally available JSONL/NDJSON sessions; it does not restore harness state, translate sessions between harnesses, scrape private Cursor databases, or claim coverage of remote-only/compressed proprietary history. Missing timestamps/results remain missing. External attachment URLs are preserved, not fetched. There is no automatic redaction: raw session text and tool outputs are intentionally retained. Remote synchronization begins only after you configure a destination. Remote retention/deletion, team identities, a web UI, and semantic search are outside this release.
