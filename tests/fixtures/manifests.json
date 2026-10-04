@@ -1,0 +1,55 @@
+{
+  "base": {
+    "schema_version": 1,
+    "collector_id": "collector-1",
+    "batch_id": "batch_1",
+    "created_at": "2026-10-01T00:00:00Z",
+    "sessions": [{"harness": "pi", "session_id": "session", "records": 1, "events": 1, "first_timestamp": null, "last_timestamp": null}],
+    "files": [
+      {"path": "records.lance/_versions/1.manifest", "size": 1, "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+      {"path": "events.lance/_versions/1.manifest", "size": 1, "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+    ]
+  },
+  "cases": [
+    {"name": "base", "valid": true, "patch": {}},
+    {"name": "nanosecond offset timestamp", "valid": true, "patch": {"created_at": "2026-10-04T18:50:16.123456789+00:00"}},
+    {"name": "replaced batches", "valid": true, "patch": {"replaces": ["old-1", "old_2"]}},
+    {"name": "empty replaced list", "valid": true, "patch": {"replaces": []}},
+    {"name": "dot in collector ID", "valid": false, "patch": {"collector_id": "team.prod"}},
+    {"name": "slash in batch ID", "valid": false, "patch": {"batch_id": "a/b"}},
+    {"name": "batch ID longer than 128", "valid": false, "patch": {"batch_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
+    {"name": "unsupported schema", "valid": false, "patch": {"schema_version": 2}},
+    {"name": "date without time", "valid": false, "patch": {"created_at": "2026-10-01"}},
+    {"name": "space instead of T", "valid": false, "patch": {"created_at": "2026-10-01 00:00:00Z"}},
+    {"name": "no files", "valid": false, "patch": {"files": []}},
+    {"name": "uppercase checksum", "valid": false, "patch": {"files": [
+      {"path": "records.lance/_versions/1.manifest", "size": 1, "sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+      {"path": "events.lance/_versions/1.manifest", "size": 1, "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+    ]}},
+    {"name": "path traversal", "valid": false, "patch": {"files": [
+      {"path": "records.lance/../../secret", "size": 1, "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+      {"path": "records.lance/_versions/1.manifest", "size": 1, "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+      {"path": "events.lance/_versions/1.manifest", "size": 1, "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+    ]}},
+    {"name": "backslash in path", "valid": false, "patch": {"files": [
+      {"path": "records.lance/_versions\\1.manifest", "size": 1, "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+      {"path": "events.lance/_versions/1.manifest", "size": 1, "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+    ]}},
+    {"name": "missing events dataset manifest", "valid": false, "patch": {"files": [
+      {"path": "records.lance/_versions/1.manifest", "size": 1, "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+      {"path": "events.lance/data/1.lance", "size": 1, "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+    ]}},
+    {"name": "duplicate path", "valid": false, "patch": {"files": [
+      {"path": "records.lance/_versions/1.manifest", "size": 1, "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+      {"path": "records.lance/_versions/1.manifest", "size": 1, "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+      {"path": "events.lance/_versions/1.manifest", "size": 1, "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+    ]}},
+    {"name": "file size above 2^53 - 1", "valid": false, "patch": {"files": [
+      {"path": "records.lance/_versions/1.manifest", "size": 9007199254740992, "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+      {"path": "events.lance/_versions/1.manifest", "size": 1, "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+    ]}},
+    {"name": "replaces itself", "valid": false, "patch": {"replaces": ["batch_1"]}},
+    {"name": "duplicate replaced batch", "valid": false, "patch": {"replaces": ["old", "old"]}},
+    {"name": "invalid replaced batch ID", "valid": false, "patch": {"replaces": ["old.batch"]}}
+  ]
+}
