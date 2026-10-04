@@ -105,7 +105,7 @@ We found no high-level problems. The primary problems are about performance. Whe
 
 ### 4.5 Tests and CI
 
-- The repository has 38 Rust tests and 6 Worker tests. Tests use synthetic fixtures only.
+- The repository has 38 Rust tests and 6 Worker tests. 2 of the Rust tests use cloud services. Tests use synthetic fixtures only.
 - CI runs an S3 test with Moto and a Worker test with `wrangler dev`.
 - CI also runs `cargo fmt --check` and `cargo clippy` with `-D warnings`.
 
@@ -278,6 +278,38 @@ Action: Add an optional step that removes secrets before the Lance write. Also a
 | --- | --- |
 | `npm run typecheck` (Worker) | Pass |
 | `npm test` (Worker) | Pass. 6 of 6 tests. |
-| `cargo test --locked` (Rust) | RUST_RESULT |
+| `cargo test --locked` (Rust 1.91.1) | Pass. 36 of 36 local tests. 2 tests ignored. |
 
-Note: The tests that use S3 and `wrangler dev` (`tests/cloud.rs`) are ignored by default. We did not run them. CI runs them.
+Note: The 2 ignored tests (`tests/cloud.rs`) use S3 and `wrangler dev`. We did not run them. CI runs them.
+
+## 9. Status of the corrections
+
+We corrected all the problems in section 5. The table gives the status. The security notes in section 6 did not change.
+
+| Problem | Status | Correction |
+| --- | --- | --- |
+| 1 | Corrected | Lance applies the harness, session, kind, text, time, and event ID filters. `query_each` sends the events of one session at a time. `get_event` finds one event with a Lance filter. `sessions` and `export` read only the necessary records. |
+| 2 | Corrected | The new `compact` command merges small batches. `watch` also does this each `compact_seconds`. The manifest has the new field `replaces`. Readers ignore replaced batches. The tool deletes the local files of replaced batches after 5 minutes. The tool keeps S3 manifests in the local cache. |
+| 3 | Corrected | The checkpoint keeps the size and the modification time. The tool does not open a file that did not change for 2 seconds. SQLite keeps the result of the identification. The tool deletes spool files after their data is in a published batch. |
+| 4 | Corrected | The Worker streams file bodies between the client and R2. The Durable Object keeps only the metadata. It gives permission before a write (`target`) and records the result after the write (`uploaded`). |
+| 5 | Corrected | The `pending` table has a `raw` BLOB column. The `bytes` value counts the record, the events, and the raw bytes. Old rows are still read. |
+| 6 | Corrected | An event is a hook event only if `payload_json` has a top-level key `hook_event_name`. This change does not need a new column. |
+| 7 | Corrected | Rust and TypeScript use the same rules. `tests/fixtures/manifests.json` has 20 cases. The Rust tests and the Worker tests use this file. |
+| 8 | Corrected | `sessions` and `export` are in the library. `Command::writes_state` uses a `match` with no default arm. |
+| 9 | Corrected | At startup, the collector deletes `.tmp-*` directories in `batches/`. It deletes `.tmp-*` entries in `cache/` that are older than 1 hour. |
+| 10 | Corrected | The prompt text did not change, so plan IDs do not change. The marker is a constant. If a prompt does not have the marker, the request stops with an error. A test examines each judge prompt. |
+| 11 | Corrected | `retryable` accepts only network errors, HTTP 429, and HTTP 5xx. `watch` uses `block_in_place` for file and SQLite work. The Worker commit uses a `Map`. The configuration returns an error if the home directory is not available. |
+
+Limits of the corrections:
+
+- The Cloudflare list API sorts by key. Thus, the tool cannot read only the new manifests. It reads the full list each time.
+- The tool does not keep an index from event ID to batch. `get_event` examines each batch with a Lance filter.
+
+Test results after the corrections:
+
+| Test | Result |
+| --- | --- |
+| `cargo clippy --locked --all-targets -- -D warnings` | Pass |
+| `cargo test --locked` (Rust 1.91.1) | Pass. 47 of 47 local tests. 2 tests ignored. |
+| `npm run typecheck` (Worker) | Pass |
+| `npm test` (Worker) | Pass. 26 of 26 tests. |
