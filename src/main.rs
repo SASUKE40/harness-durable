@@ -5,7 +5,7 @@ use harness_durable::{
     archive,
     assessment::{Criteria, MatchMode},
     config::Config,
-    feedback, hooks,
+    feedback, hooks, human,
     llm::HttpModel,
     mcp,
     model::Query,
@@ -69,6 +69,17 @@ enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Record a human task/step label; optionally accept the task as an oracle.
+    Label(Box<LabelOptions>),
+    /// List current labels, or include superseded revisions with --history.
+    Labels {
+        #[arg(long)]
+        task: Option<String>,
+        #[arg(long)]
+        history: bool,
+    },
+    /// Apply accepted oracle snapshots, human labels, and optional model judgments.
+    Evaluate(Box<EvaluateOptions>),
     Export {
         #[command(flatten)]
         read: ReadOptions,
@@ -163,6 +174,54 @@ struct Check {
     judge: bool,
     #[command(flatten)]
     gates: regression::Gates,
+}
+#[derive(Args)]
+struct LabelOptions {
+    #[command(flatten)]
+    input: SessionInput,
+    #[arg(long)]
+    task: String,
+    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=1))]
+    reward: u8,
+    #[arg(long)]
+    reviewer: String,
+    #[arg(long)]
+    note: String,
+    /// Optional 1-based step number. Omit to label the whole task result.
+    #[arg(long)]
+    step: Option<usize>,
+    /// Accept a passing whole-task result as an oracle for this task.
+    #[arg(long, conflicts_with = "step")]
+    oracle: bool,
+    /// Record a revision; all previous annotations remain in the audit history.
+    #[arg(long)]
+    replace: bool,
+    /// Label provenance for demonstrations; never presented as human review.
+    #[arg(long)]
+    synthetic: bool,
+}
+#[derive(Args)]
+struct EvaluateOptions {
+    #[command(flatten)]
+    input: SessionInput,
+    #[arg(long)]
+    task: String,
+    #[arg(long)]
+    output: PathBuf,
+    /// Choose specific current oracle label IDs; otherwise use all for this task.
+    #[arg(long)]
+    oracle_label: Vec<String>,
+    #[arg(long, value_enum)]
+    matching: Option<MatchMode>,
+    #[arg(long)]
+    criteria: Option<PathBuf>,
+    /// Enable provider calls; without this, human and deterministic evaluation only.
+    #[arg(long)]
+    judge: bool,
+    #[command(flatten)]
+    gates: regression::Gates,
+    #[command(flatten)]
+    human_gates: human::HumanGates,
 }
 fn criteria_file(path: &Option<PathBuf>, config: &mut feedback::FeedbackConfig) -> Result<()> {
     if let Some(path) = path {
@@ -491,6 +550,27 @@ async fn main() -> Result<()> {
         println!("{}", String::from_utf8(bytes)?);
         return Ok(());
     }
+    if let Command::Labels { task, history } = &cli.command {
+        let registry = human::Registry::load(&c.state_dir.join("human-labels"))?;
+        let labels = if *history {
+            registry.labels.iter().collect()
+        } else {
+            registry.current()
+        };
+        let current_ids: HashSet<_> = registry.current().iter().map(|l| l.id.as_str()).collect();
+        for l in labels
+            .into_iter()
+            .filter(|l| task.as_ref().is_none_or(|t| t == &l.task))
+        {
+            println!(
+                "{}",
+                serde_json::to_string(
+                    &serde_json::json!({"id":l.id,"task":l.task,"session":l.trajectory.session_id,"harness":l.trajectory.harness,"trajectory_id":l.trajectory_id,"step":l.step,"reward":l.reward,"oracle":l.oracle,"reviewer":l.reviewer,"note":l.note,"origin":l.origin,"current":current_ids.contains(l.id.as_str()),"supersedes":l.supersedes})
+                )?
+            );
+        }
+        return Ok(());
+    }
     let readonly = matches!(
         cli.command,
         Command::Status
@@ -501,6 +581,8 @@ async fn main() -> Result<()> {
             | Command::Snapshot(_)
             | Command::Check(_)
             | Command::Browse { .. }
+            | Command::Label(_)
+            | Command::Evaluate(_)
     );
     let mut state = if readonly && c.state_dir.join("state.sqlite").exists() {
         State::open_reader(&c.state_dir)?
@@ -508,6 +590,92 @@ async fn main() -> Result<()> {
         State::open(&c.state_dir)?
     };
     match cli.command {
+        Command::Label(args) => {
+            let trajectory = session_input(&state, &c, &args.input).await?;
+            ensure!(
+                trajectory.steps.len() <= c.feedback.max_steps,
+                "trajectory exceeds configured max_steps"
+            );
+            let label = human::annotate(
+                &c.state_dir.join("human-labels"),
+                trajectory,
+                human::NewLabel {
+                    task: args.task,
+                    step: args.step,
+                    reward: args.reward,
+                    reviewer: args.reviewer,
+                    note: args.note,
+                    origin: if args.synthetic {
+                        human::Origin::Synthetic
+                    } else {
+                        human::Origin::Human
+                    },
+                    oracle: args.oracle,
+                    replace: args.replace,
+                },
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &serde_json::json!({"label_id":label.id,"task":label.task,"session":label.trajectory.session_id,"trajectory_id":label.trajectory_id,"step":label.step,"reward":label.reward,"oracle":label.oracle,"origin":label.origin,"supersedes":label.supersedes})
+                )?
+            );
+        }
+        Command::Evaluate(args) => {
+            let registry = human::Registry::load(&c.state_dir.join("human-labels"))?;
+            let candidate = session_input(&state, &c, &args.input).await?;
+            if let Some(mode) = args.matching {
+                c.feedback.matching = mode;
+            }
+            criteria_file(&args.criteria, &mut c.feedback)?;
+            let models = if args.judge {
+                Some((
+                    HttpModel::new(
+                        c.feedback
+                            .judge
+                            .clone()
+                            .context("configure feedback.judge")?,
+                    )?,
+                    HttpModel::new(
+                        c.feedback
+                            .reporter
+                            .clone()
+                            .context("configure feedback.reporter")?,
+                    )?,
+                ))
+            } else {
+                None
+            };
+            let result = human::evaluate(
+                &registry,
+                candidate,
+                human::EvaluationOptions {
+                    task: args.task,
+                    oracle_label_ids: args.oracle_label,
+                    config: c.feedback,
+                    gates: args.gates,
+                    human_gates: args.human_gates,
+                },
+                &absolute(&args.output)?,
+                models.as_ref().map(|(j, r)| {
+                    (
+                        j as &dyn harness_durable::llm::LanguageModel,
+                        r as &dyn harness_durable::llm::LanguageModel,
+                    )
+                }),
+            )
+            .await?;
+            println!(
+                "{} — {}\nReport: {}\nResult: {}",
+                if result.passed { "PASS" } else { "FAIL" },
+                result.task,
+                absolute(&args.output)?.join("report.md").display(),
+                absolute(&args.output)?.join("result.json").display()
+            );
+            if !result.passed {
+                std::process::exit(2);
+            }
+        }
         Command::Snapshot(args) => {
             let trajectory = session_input(&state, &c, &args.input).await?;
             let mut config = c.feedback.clone();
@@ -793,7 +961,8 @@ async fn main() -> Result<()> {
         Command::Discover(_)
         | Command::Hooks { .. }
         | Command::Mcp { .. }
-        | Command::Calibrate { .. } => unreachable!(),
+        | Command::Calibrate { .. }
+        | Command::Labels { .. } => unreachable!(),
     }
     Ok(())
 }

@@ -4,6 +4,7 @@ pub mod assessment;
 pub mod config;
 pub mod feedback;
 pub mod hooks;
+pub mod human;
 pub mod llm;
 pub mod mcp;
 pub mod model;

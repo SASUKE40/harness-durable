@@ -182,6 +182,70 @@ harness-durable calibrate --labels labels.json --output calibration.json
 
 The output reports confusion counts, agreement, precision, and recall overall and grouped by judge/model/rubric configuration. Step numbers are 1-based; duplicate labels and invalid saved judgments are rejected. Undefined ratios are null. Use representative held-out labels; agreement on a small selected sample is not a general accuracy estimate. This first calibration command covers the original quality reward, not the separate dimension/milestone judgments.
 
+## Human labels and accepted oracles
+
+`label` records an explicit review of an archived task result or one of its steps. `--task` groups runs of the **same task**; use a different task key when the request or acceptance criteria change. Each annotation pins the complete trajectory, final output, and content hash, plus reviewer name, note, and creation time. A later append to the session creates a different snapshot and does not inherit earlier labels.
+
+```sh
+# Record a passing result and accept that exact snapshot as an oracle.
+harness-durable label --task parser-fix --session ORACLE_ID \
+  --reward 1 --reviewer edward --note "Reviewed implementation and test evidence" --oracle
+
+# Accept another valid solution by labeling another session under the same task.
+harness-durable label --task parser-fix --session ALTERNATE_ID \
+  --reward 1 --reviewer edward --note "Accepted alternative implementation" --oracle
+
+# Supply a candidate task verdict and, optionally, individual step judgments.
+harness-durable label --task parser-fix --session CANDIDATE_ID \
+  --reward 0 --reviewer edward --note "Required verification is missing"
+harness-durable label --task parser-fix --session CANDIDATE_ID --step 1 \
+  --reward 1 --reviewer edward --note "Inspected the relevant source"
+
+harness-durable labels --task parser-fix
+harness-durable labels --task parser-fix --history
+
+# Apply the accepted oracles and candidate labels without any model requests.
+harness-durable evaluate --task parser-fix --session CANDIDATE_ID \
+  --output ./review-evaluation --require-human-label
+
+# Optional human step gates; unlabeled steps remain unscored.
+harness-durable evaluate --task parser-fix --session CANDIDATE_ID \
+  --output ./fully-reviewed --require-human-label \
+  --min-human-quality 0.9 --min-human-coverage 1
+```
+
+Only a passing **whole-task** label can be an oracle. Repeat `--oracle-label LABEL_ID` on `evaluate` to select particular active references; otherwise it uses all active oracles for the task, up to five. The exact candidate snapshot cannot also be an oracle. Matching defaults to configured BM25; `--matching`, `--criteria`, and the existing regression gates work as on `compare`/`check`. One complete reference variant must satisfy the regression gates. Structural differences still fail default zero-tolerance gates even when a human task label is positive; choose matching and allowances to fit your task.
+
+Human task reward, mean human step reward, human labeling coverage, model quality, and required-work coverage are separate. A human task failure always fails the applied evaluation. A passing task label does not generate passing step labels or override failed outcome checks. The human step mean uses only explicitly labeled steps; `--min-human-coverage` prevents a small labeled subset from appearing complete. Missing task labels are allowed unless `--require-human-label` is specified; without them a structural pass is not human approval. `evaluate` exits 0 on pass, 2 on failed gates/review, and 1 on an operational error.
+
+Add `--judge` to run configured Jev/Opus evaluation. Step judgments remain independent of candidate human labels; the report model receives annotations and reviewer notes to explain disagreements. These provider calls send selected session evidence and review annotations. Saved model decisions are reused on identical retries. The `--min-quality` flag gates the model mean; `--min-human-quality` gates the human mean.
+
+Labels live in `STATE_DIR/human-labels/labels.json`, with atomic writes and a separate writer lock so labeling can coexist with capture. There is one active annotation per task/snapshot/step. Identical retries are idempotent. To change a verdict, note, reviewer, or oracle status, repeat `label` with `--replace`; superseded revisions remain in the history. To revoke an oracle, replace its whole-task label and omit `--oracle`. Reviewer names are supplied metadata, not authenticated accounts. This is a single-owner review workflow, not a multi-reviewer voting system.
+
+Evaluation output contains:
+
+- `human-input.json`: pinned annotations, accepted oracle snapshots, candidate evidence, and policy.
+- `result.json` and `report.md`: combined decision with separate human/model scores and failures.
+- `regression/check.json` and `regression/check.md`: reference selection and structural/outcome details.
+- `regression/<variant-id>/`: resumable model checkpoints, report, and feedback Lance archive when `--judge` is used.
+- `archive/`: standalone Lance records/events/manifest containing `human_label`, `human_evaluation`, and `human_report` events, including offline runs.
+
+```sh
+harness-durable query --archive ./review-evaluation/archive \
+  --kind human_label --format jsonl
+```
+
+Changed labels, selected oracles, policies, or candidate evidence require a new evaluation directory. Existing reports remain historical snapshots. Annotations and evaluation archives are local and are not automatically added to the collector's cloud upload queue. `label` and `evaluate` accept `--archive`, `--remote`, `--harness`, `--leaf`, and `--final-output` for source selection.
+
+For a complete synthetic demonstration with two accepted oracle variants, a failing candidate, and a passing candidate:
+
+```sh
+cargo build --locked
+sh examples/human-review-demo.sh
+```
+
+The script uses an isolated temporary state directory and explicitly marks its annotations `--synthetic`. Applying them requires `--allow-synthetic`; reports identify them as demonstration labels, never actual human review. The demo uses no model APIs or cloud uploads and does not execute the tool commands recorded in its fixtures.
+
 ## Configuration
 
 See [config.example.toml](config.example.toml). By default the configuration is `~/.harness-durable/config.toml`, and state is stored in `~/.harness-durable`. `--config` overrides the configuration location; `--state-dir` overrides storage only. Paths are literal and do not expand shell variables or `~`.
